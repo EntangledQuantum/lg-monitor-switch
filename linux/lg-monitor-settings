@@ -11,6 +11,7 @@ import importlib.util
 import os
 import sys
 import threading
+import time
 
 import gi
 
@@ -57,6 +58,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.cfg = lg.load_config()
         self.deskflow = lg.deskflow_info()
         self._loading = True
+        self._refresh_started = False
 
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -367,57 +369,127 @@ class SettingsWindow(Adw.ApplicationWindow):
         delay.connect("notify::value", lambda r, _p: self._set("deskflow", "delay", "%g" % r.get_value()))
         g.add(delay)
 
-        path, why = lg.deskflow_log_status(self.cfg, info)
-        self.log_row = Adw.ExpanderRow(title="Deskflow log file", subtitle=why, use_markup=False)
-        self.log_row.add_prefix(Gtk.Image.new_from_icon_name(
-            "emblem-ok-symbolic" if path and os.path.exists(path) else "dialog-warning-symbolic"))
-        steps = Gtk.Label(wrap=True, xalign=0, selectable=True, margin_top=8, margin_bottom=8,
-                          margin_start=12, margin_end=12)
-        steps.set_text(
-            "Deskflow only reports screen changes in its log, so its “Log to file” option must be on. "
-            "lg-monitor will not change this for you:\n\n"
-            "1. Open Deskflow → Settings (File → Settings, or the gear menu).\n"
-            "2. In the Log section tick “Log to file” and keep the log level at Info (or higher).\n"
-            "3. Set the log path to:\n    %s\n"
-            "   (the Flatpak version can only write inside its own ~/.var/app folder).\n"
-            "4. Press OK, then stop and start the Deskflow server once.\n\n"
-            "Or type the log file path below." % (lg.RECOMMENDED_FLATPAK_LOG if info["kind"] == "flatpak"
-                                                  else "~/deskflow.log"))
-        self.log_row.add_row(steps)
-        entry = Adw.EntryRow(title="Log file path (empty = automatic)")
-        val = self.cfg.get("deskflow", "log_file")
-        entry.set_text("" if val == "auto" else val)
-        entry.set_show_apply_button(True)
-        entry.connect("apply", lambda r: self._set("deskflow", "log_file", r.get_text().strip() or "auto"))
-        self.log_row.add_row(entry)
+        # ---- log file status (refreshed live) ----
+        self.log_row = Adw.ExpanderRow(title="Deskflow log file", use_markup=False)
+        self.log_icon = Gtk.Image()
+        self.log_row.add_prefix(self.log_icon)
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER,
+                              tooltip_text="Copy the log path to paste into Deskflow's settings")
+        copy_btn.add_css_class("flat")
+        copy_btn.connect("clicked", self._copy_log_path)
+        self.log_row.add_suffix(copy_btn)
+        self.log_steps = Gtk.Label(wrap=True, xalign=0, selectable=True, margin_top=8, margin_bottom=8,
+                                   margin_start=12, margin_end=12)
+        self.log_row.add_row(self.log_steps)
+
+        manual = self.cfg.get("deskflow", "log_file").strip()
+        self.auto_log = Adw.SwitchRow(title="Find Deskflow's log automatically",
+                                      subtitle="Recommended. Follows Deskflow's own “Log to file” setting.")
+        self.auto_log.set_active(manual.lower() in ("", "auto"))
+        self.auto_log.connect("notify::active", self._on_auto_log_toggled)
+        self.log_row.add_row(self.auto_log)
+        self.log_entry = Adw.EntryRow(title="Custom log file path (advanced)")
+        self.log_entry.set_text("" if manual.lower() in ("", "auto") else manual)
+        self.log_entry.set_show_apply_button(True)
+        self.log_entry.set_sensitive(not self.auto_log.get_active())
+        self.log_entry.connect("apply", self._on_log_path_applied)
+        self.log_row.add_row(self.log_entry)
         g.add(self.log_row)
 
-        mapping = dict(self.cfg.items("deskflow.screens"))
-        screens = list(info["screens"])
-        for s in mapping:
-            if s not in screens:
-                screens.append(s)
+        self.watch_row = Adw.ActionRow(title="Auto-switch service", use_markup=False)
+        self.watch_row.add_prefix(Gtk.Image.new_from_icon_name("system-run-symbolic"))
+        g.add(self.watch_row)
+
+        # ---- screen mapping ----
+        explicit = {k: v.strip().lower() for k, v in self.cfg.items("deskflow.screens")}
+        screens = list(info["screens"]) + [s for s in explicit if s not in info["screens"]]
         if not screens:
-            g.add(Adw.ActionRow(title="No Deskflow screens found",
+            g.add(Adw.ActionRow(title="No Deskflow screens found", use_markup=False,
                                 subtitle="Add screens under [deskflow.screens] in ~/.config/lg-monitor/config.ini"))
         for screen in screens:
-            if screen in mapping:
-                current = mapping[screen].strip().lower() or "none"
-            elif screen == info["local_screen"]:
-                current = self.cfg.get("monitor", "home_input")
-            else:
-                current = self.cfg.get("monitor", "switch_target")
+            current = explicit.get(screen) or lg.default_screen_input(self.cfg, screen, info)
             try:
-                idx = MAP_KEYS.index(current if current == "none" else lg.normalize_input(current))
+                idx = MAP_KEYS.index("none" if current in ("none", "off") else lg.normalize_input(current))
             except (ValueError, lg.LgError):
                 idx = 0
-            if screen not in mapping:
-                self.cfg.set("deskflow.screens", screen, MAP_KEYS[idx])
             label = "Cursor on “%s”%s" % (screen, " (this computer)" if screen == info["local_screen"] else "")
             g.add(self.combo(label, MAP_NAMES, idx,
                              lambda i, s=screen: self._set("deskflow.screens", s, MAP_KEYS[i]),
                              subtitle="switch the monitor to"))
+        self._refresh_deskflow()
+        GLib.timeout_add_seconds(3, self._refresh_deskflow)
         return g
+
+    def _refresh_deskflow(self):
+        """Show the real state of Deskflow's log and of the watcher service."""
+        if not self.get_visible() and self._refresh_started:
+            return GLib.SOURCE_REMOVE
+        self._refresh_started = True
+        info = lg.deskflow_info()
+        rep = lg.deskflow_log_report(self.cfg, info)
+        self._log_report = rep
+        good = rep["state"] in ("ok", "manual") and rep["usable"]
+        self.log_icon.set_from_icon_name("emblem-ok-symbolic" if good else "dialog-warning-symbolic")
+        self.log_row.set_subtitle(rep["message"])
+        self.log_steps.set_text(
+            "Deskflow only reports screen changes in its log, so its “Log to file” option must be on. "
+            "LG Monitor Switch never changes Deskflow's settings, so do this once in Deskflow:\n\n"
+            "1. Open Deskflow → Settings.\n"
+            "2. Tick “Log to file”; keep the log level at Info (or more detailed).\n"
+            "3. Set the log path to (copy button above):\n    %s\n%s"
+            "4. Press OK/Apply. The auto-switch picks the file up by itself, no restart needed."
+            % (rep["recommended"], "   The Flatpak version can only write inside ~/.var/app/%s/.\n"
+               % lg.DESKFLOW_FLATPAK_ID if info["kind"] == "flatpak" else ""))
+        self.watch_row.set_subtitle(self._watcher_text(rep))
+        return GLib.SOURCE_CONTINUE
+
+    def _watcher_text(self, rep):
+        if not lg.feature_enabled(self.cfg, "deskflow"):
+            return "Off"
+        st = lg.read_watch_state()
+        if not st or not st.get("alive"):
+            return "Not running (it starts when the switch above is on; see journalctl --user -u lg-monitor-deskflow)"
+        if st.get("source") == "file":
+            src = "Following %s" % lg.tilde(st.get("path"))
+        elif st.get("source") == "journal":
+            src = "No log file yet, watching the journal and retrying"
+        else:
+            src = "Waiting for a log file"
+        last = st.get("last_line")
+        seen = ("last cursor move %s (%s)" % (lg.human_age(time.time() - last), st.get("last_event"))
+                if last else "no cursor move seen yet")
+        sw = st.get("last_switch")
+        switched = ("; last switch to %s %s%s" % (sw["input"], lg.human_age(time.time() - sw["time"]),
+                                                   "" if sw.get("ok") else " FAILED")) if sw else ""
+        return "%s · %s%s" % (src, seen, switched)
+
+    def _copy_log_path(self, _b):
+        path = (getattr(self, "_log_report", None) or {}).get("recommended")
+        if path:
+            Gdk.Display.get_default().get_clipboard().set(path)
+            self.toast("Copied %s" % path)
+
+    def _on_auto_log_toggled(self, row, _p):
+        if self._loading:
+            return
+        auto = row.get_active()
+        self.log_entry.set_sensitive(not auto)
+        if auto:
+            self._set("deskflow", "log_file", "auto")
+        elif self.log_entry.get_text().strip():
+            self._on_log_path_applied(self.log_entry)
+        self._refresh_deskflow()
+
+    def _on_log_path_applied(self, entry):
+        text = entry.get_text().strip()
+        if not text:
+            self.auto_log.set_active(True)
+            return
+        path = os.path.expanduser(text)
+        self._set("deskflow", "log_file", text)
+        if not os.path.isfile(path):
+            self.toast("Warning: %s does not exist (yet)" % text)
+        self._refresh_deskflow()
 
     def _on_deskflow_toggled(self, row, _p):
         if self._loading:

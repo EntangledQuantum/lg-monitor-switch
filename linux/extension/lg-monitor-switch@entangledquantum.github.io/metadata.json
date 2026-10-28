@@ -4,5 +4,5 @@
   "description": "Brightness and contrast sliders and a one-click input switch for LG UltraGear monitors shared between two computers. Uses the lg-monitor command line tool (ddcutil + i2c-tools).",
   "shell-version": ["46", "47", "48"],
   "url": "https://github.com/EntangledQuantum/lg-monitor-switch",
-  "version-name": "1.0.0"
+  "version-name": "1.0.1"
 }

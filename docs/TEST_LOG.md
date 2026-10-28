@@ -132,3 +132,69 @@ the agent. The same packets were confirmed visually by the user earlier.
 - Deskflow auto-switch with real Deskflow log output (needs *Log to file* turned on by the user).
 - Reboot / fresh-login autostart.
 - GNOME 47/48 (declared in metadata, uses only APIs unchanged since 46).
+
+# v1.0.1: Deskflow auto-switch fixes (2026-10-29)
+
+## What went wrong in 1.0.0 (seen on a real Flatpak Deskflow install)
+
+- The watcher picked its log source **once at startup**. At that moment Deskflow was set to log to `~/deskflow.log`,
+  which the Flatpak sandbox silently cannot write, so no file existed. The watcher fell back to
+  `journalctl --user -f` and stayed there forever. After the user fixed Deskflow's log path, it still needed a
+  manual `systemctl --user restart`.
+- The settings app said "'Log to file' is off" although it was on; the real problem was the path outside the
+  sandbox.
+- `switch from` lines are logged at **INFO** (checked in a real log: all of them were `INFO: switch from`), so
+  Deskflow's log level must be Info or more detailed.
+
+## Unit tests
+
+`/usr/bin/python3 -m unittest discover -s tests` → **43 tests, OK** (the 24 earlier ones unchanged). New tests, all
+in a temporary fake HOME with fake `Deskflow.conf` files and a recording fake instead of real switches:
+
+| Test | Covers |
+|---|---|
+| `test_flatpak_ok`, `test_not_created_yet`, `test_log_to_file_off`, `test_quiet_log_level_warning` | report states |
+| `test_flatpak_outside_sandbox_without_fallback` | Flatpak path outside sandbox → no path, exact path to use in the message; a stale host-side file is NOT used |
+| `test_flatpak_outside_sandbox_falls_back_to_recent_log` | falls back to the newest `*.log` inside the Flatpak data dir |
+| `test_manual_path_missing_falls_back` | a custom path that doesn't exist → warning + automatic candidate; empty = automatic |
+| `test_native_install`, `test_both_configs_prefer_running_kind`, `test_appimage_detected` | native / AppImage / both installed |
+| `test_effective_mapping_defaults` | screens without a mapping get defaults; explicit `none` respected |
+| `test_rotation_by_rename` | rotation: rest of the old file, then the new file from the top |
+| `test_file_appears_after_startup` | file created after start is picked up; retrying stops once it exists |
+| `test_no_redetection_while_working` | 5 loop iterations, 5 simulated minutes → detection ran **once** |
+| `test_deskflow_log_path_changes_while_running` | Deskflow.conf changes A → B: follows B, ignores A |
+| `test_journal_to_file_transition` | journal fallback works (fake journal via `tail -F`), then switches to the file once Deskflow is configured |
+| `test_outside_sandbox_then_fixed` | user fixes the Flatpak path → file followed without a restart; bounce cancels |
+| `test_lg_config_change_applies_without_restart` | mapping change in config.ini applies live |
+| `test_failed_switch_is_not_remembered` | a failed switch doesn't make the watcher think the input changed |
+
+## End-to-end dry run (real `lg-monitor deskflow-watch --dry-run` process, temp HOME, fake Flatpak config)
+
+```
+mapping {'linux-pc': 'dp1', 'windows-pc': 'hdmi2'}, delay 1s [dry run]
+Deskflow (Flatpak) is set to log to ~/deskflow.log, which is outside its sandbox, ... set the log path to ~/.var/app/org.deskflow.deskflow/data/deskflow.log.
+following the user journal (fallback) (start)
+   deskflow-info meanwhile: log.state=outside_sandbox, watcher.source=journal, searching=True
+Deskflow will log to ~/.var/app/.../deskflow.log, but the file does not exist yet. ...
+now following log file ~/.var/app/org.deskflow.deskflow/data/deskflow.log (settings changed)
+cursor -> windows-pc: schedule
+switching monitor to hdmi2 (dry run)
+cursor -> linux-pc: schedule
+cursor -> windows-pc: cancel                       (bounce within 0.3 s)
+cursor -> linux-pc: schedule
+switching monitor to dp1 (dry run)
+Deskflow logs to ~/.var/app/.../deskflow.log (last written 1 s ago).    (retry found the file -> retrying stops)
+cursor -> windows-pc: schedule                     (after renaming the log away = rotation)
+switching monitor to hdmi2 (dry run)
+settings changed: mapping {'linux-pc': 'dp1', 'windows-pc': 'hdmi1'}, delay 1s   (config.ini edited)
+cursor -> linux-pc: schedule
+switching monitor to dp1 (dry run)
+cursor -> windows-pc: schedule
+switching monitor to hdmi1 (dry run)
+   deskflow-info at the end: log.state=ok, watcher.source=file, searching=False, alive=True
+```
+
+No real input switches were made for 1.0.1. The settings app was rendered in the headless GNOME Shell harness
+(new log-file row with copy button, auto/custom path switch, live "Auto-switch service" row); see
+`docs/images/settings.png`. The `.deb` was built (`dist/lg-monitor-switch_1.0.1_all.deb`) but not installed
+by the agent (needs sudo).

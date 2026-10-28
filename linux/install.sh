@@ -8,6 +8,7 @@
 # Nothing here touches Deskflow. The Deskflow auto-switch is OFF by default and
 # can only be enabled from the settings app.
 set -euo pipefail
+umask 022   # files must stay readable by GNOME Shell etc. even with a strict user umask
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"

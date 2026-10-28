@@ -80,7 +80,7 @@ Windows app ──HTTP (token)──▶ lg-monitor listener on Linux ──I²C 
 
 ## Deskflow log lines
 
-The Deskflow server logs (level INFO) one of these whenever the cursor changes screen:
+The Deskflow server logs (level INFO, so Deskflow's log level must be Info or more detailed) one of these whenever the cursor changes screen:
 
 ```
 [2026-10-29T10:00:00] INFO: switch from "linux-pc" to "windows-pc" at 1919,540
@@ -92,5 +92,20 @@ The Deskflow server logs (level INFO) one of these whenever the cursor changes s
 `tests/test_lg_monitor.py`.
 
 It reads Deskflow's *Log to file* output, found through Deskflow's own settings file (read-only:
-`~/.var/app/org.deskflow.deskflow/config/Deskflow/Deskflow.conf`, keys `[log] toFile`, `file`). The core server's
-output isn't in the systemd journal, so the journal fallback only helps if a future Deskflow version logs there.
+`~/.var/app/org.deskflow.deskflow/config/Deskflow/Deskflow.conf` for the Flatpak, `~/.config/Deskflow/Deskflow.conf`
+for native/AppImage builds; keys `[log] toFile`, `file`, `level`). If both exist, the one belonging to the running
+Deskflow process is used (a Flatpak process is recognised by its `app-flatpak-` cgroup). A Flatpak can only write
+inside `~/.var/app/org.deskflow.deskflow/`. If its configured path is outside the sandbox, the most recently
+modified `*.log` inside that folder is followed instead, and the user is told the exact path to set.
+
+Re-detection (`DeskflowWatcher` in `linux/lg-monitor`):
+
+- The watcher stats lg-monitor's `config.ini`, Deskflow's `Deskflow.conf` files and Deskflow's server config on
+  every loop iteration (0.25 s). Only when one of them changes does it re-run detection and switch to another log
+  file if needed, so there is no periodic re-scanning while things work.
+- While no usable log file exists (file missing, *Log to file* off, Flatpak path outside the sandbox), it retries
+  detection every 7 s and follows the user journal as a last resort. It stops retrying once a file is found.
+- Log rotation and truncation are handled by the file follower (it finishes the old file, then reads the new one
+  from the top).
+- Health is written to `$XDG_RUNTIME_DIR/lg-monitor-UID/deskflow-watch.json` (source, path, last cursor event,
+  last switch) and shown by `lg-monitor deskflow-info` and the settings app.

@@ -32,7 +32,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 APP_ID = "io.github.entangledquantum.LgMonitorSwitch"
 
 # ---------------------------------------------------------------------------
@@ -577,11 +577,32 @@ def cmd_serve(cfg, args):
 # ---------------------------------------------------------------------------
 
 DESKFLOW_FLATPAK_ID = "org.deskflow.deskflow"
-DESKFLOW_CONF_CANDIDATES = [
-    os.path.join(HOME, ".var/app/org.deskflow.deskflow/config/Deskflow/Deskflow.conf"),
-    os.path.join(HOME, ".config/Deskflow/Deskflow.conf"),
-]
 SWITCH_LINE_RE = re.compile(r'\b(?:switch|jump) from "([^"]+)" to "([^"]+)"')
+WATCH_STATE_FILE = os.path.join(RUNTIME_DIR, "deskflow-watch.json")
+# Deskflow writes "switch from" lines at level INFO; these levels hide them.
+QUIET_LOG_LEVELS = ("FATAL", "ERROR", "WARNING", "NOTE")
+
+
+def _home(home=None):
+    return home or os.path.expanduser("~")
+
+
+def flatpak_data_dir(home=None):
+    return os.path.join(_home(home), ".var/app", DESKFLOW_FLATPAK_ID)
+
+
+def recommended_flatpak_log(home=None):
+    return os.path.join(flatpak_data_dir(home), "data", "deskflow.log")
+
+
+def deskflow_conf_candidates(home=None):
+    home = _home(home)
+    paths = [os.path.join(flatpak_data_dir(home), "config/Deskflow/Deskflow.conf"),
+             os.path.join(home, ".config/Deskflow/Deskflow.conf")]
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and not xdg.startswith(os.path.join(home, ".config")):
+        paths.append(os.path.join(xdg, "Deskflow/Deskflow.conf"))
+    return paths
 
 
 def read_qt_ini(path):
@@ -621,83 +642,221 @@ def parse_server_conf_screens(path):
     return names
 
 
-def deskflow_info():
-    """Detect Deskflow and gather (read-only) what we need from its settings."""
-    info = {"installed": False, "kind": None, "config": None, "log_to_file": False,
-            "log_file": None, "log_level": None, "screens": [], "local_screen": None}
-    flatpak_dirs = ["/var/lib/flatpak/app/" + DESKFLOW_FLATPAK_ID,
-                    os.path.join(HOME, ".local/share/flatpak/app", DESKFLOW_FLATPAK_ID)]
-    if any(os.path.isdir(d) for d in flatpak_dirs):
-        info.update(installed=True, kind="flatpak")
-    elif shutil.which("deskflow") or shutil.which("deskflow-core"):
-        info.update(installed=True, kind="native")
-    for conf in DESKFLOW_CONF_CANDIDATES:
-        data = read_qt_ini(conf)
-        if data is None:
+def _is_flatpak_wrapper(path):
+    """True for small shell scripts that just run the Flatpak (e.g. /usr/local/bin/deskflow)."""
+    try:
+        if os.path.getsize(path) > 4096:
+            return False
+        with open(path, "rb") as fh:
+            return b"flatpak run" in fh.read()
+    except OSError:
+        return False
+
+
+def deskflow_installs(home=None):
+    """All Deskflow installations found, as [(kind, location)]. Read-only."""
+    home = _home(home)
+    found = []
+    for d in ("/var/lib/flatpak/app/" + DESKFLOW_FLATPAK_ID,
+              os.path.join(home, ".local/share/flatpak/app", DESKFLOW_FLATPAK_ID)):
+        if os.path.isdir(d):
+            found.append(("flatpak", d))
+            break
+    for name in ("deskflow", "deskflow-core", "deskflow-server"):
+        cands = [shutil.which(name)] + [os.path.join(d, name) for d in
+                                         ("/usr/bin", "/usr/local/bin", "/opt/deskflow/bin", "/opt/deskflow")]
+        hit = next((p for p in cands if p and os.access(p, os.X_OK) and not _is_flatpak_wrapper(p)), None)
+        if hit:
+            found.append(("native", hit))
+            break
+    images = []
+    for d in ("Applications", ".local/bin", "bin", "Downloads", ".local/share/applications"):
+        images += glob.glob(os.path.join(home, d, "*[Dd]eskflow*.[Aa]pp[Ii]mage"))
+    images += glob.glob("/opt/*[Dd]eskflow*.[Aa]pp[Ii]mage")
+    if images:
+        found.append(("appimage", max(images, key=os.path.getmtime)))
+    return found
+
+
+def deskflow_running(proc_root="/proc"):
+    """Return 'flatpak', 'native' or None depending on a running Deskflow process."""
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "comm")) as fh:
+                comm = fh.read().strip()
+            if not comm.startswith("deskflow"):
+                continue
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as fh:
+                cmd = fh.read().split(b"\0")[0].decode(errors="replace")
+            with open(os.path.join(proc_root, pid, "cgroup"), errors="replace") as fh:
+                cgroup = fh.read()
+        except OSError:
             continue
+        sandboxed = (cmd.startswith("/app/") or "app-flatpak-" in cgroup
+                     or os.path.exists(os.path.join(proc_root, pid, "root", ".flatpak-info")))
+        return "flatpak" if sandboxed else "native"
+    return None
+
+
+def deskflow_info(home=None, running=None):
+    """Detect Deskflow and gather (read-only) what we need from its settings."""
+    home = _home(home)
+    installs = deskflow_installs(home)
+    if running is None:
+        running = deskflow_running()
+    info = {"installed": bool(installs), "kind": None, "installs": [k for k, _ in installs],
+            "running": running, "config": None, "server_config": None, "log_to_file": False,
+            "log_file": None, "log_level": None, "screens": [], "local_screen": None}
+    confs = [c for c in deskflow_conf_candidates(home) if os.path.isfile(c)]
+    if running == "flatpak":
+        confs.sort(key=lambda c: "/.var/app/" not in c)
+    elif running == "native":
+        confs.sort(key=lambda c: "/.var/app/" in c)
+    elif confs:
+        confs.sort(key=os.path.getmtime, reverse=True)
+    if confs:
+        info["config"] = conf = confs[0]
         info["installed"] = True
-        info["kind"] = info["kind"] or ("flatpak" if "/.var/app/" in conf else "native")
-        info["config"] = conf
+        data = read_qt_ini(conf) or {}
         log = data.get("log", {})
         info["log_to_file"] = log.get("toFile", "false").lower() == "true"
-        info["log_file"] = log.get("file") or None
+        info["log_file"] = os.path.expanduser(log["file"]) if log.get("file") else None
         info["log_level"] = log.get("level")
         info["local_screen"] = data.get("core", {}).get("computerName")
-        screens = []
-        for sec, kv in data.items():
-            if sec.startswith("computer_") and kv.get("name"):
-                screens.append(kv["name"])
+        screens = [kv["name"] for sec, kv in data.items() if sec.startswith("computer_") and kv.get("name")]
         server_conf = data.get("server", {}).get("externalConfigFile") or os.path.join(
             os.path.dirname(conf), "deskflow-server.conf")
+        info["server_config"] = server_conf
         screens += parse_server_conf_screens(server_conf)
         if info["local_screen"]:
             screens.insert(0, info["local_screen"])
-        seen = []
-        for s in screens:
-            if s and s not in seen:
-                seen.append(s)
-        info["screens"] = seen
-        break
+        info["screens"] = list(dict.fromkeys(s for s in screens if s))
+    info["kind"] = running or ("flatpak" if info["config"] and "/.var/app/" in info["config"] else None) \
+        or (installs[0][0] if installs else None)
     return info
 
 
-FLATPAK_DATA_DIR = os.path.join(HOME, ".var/app", DESKFLOW_FLATPAK_ID)
-RECOMMENDED_FLATPAK_LOG = os.path.join(FLATPAK_DATA_DIR, "data", "deskflow.log")
-
-
-def tilde(path):
+def tilde(path, home=None):
     """Show paths under the home directory as ~/..."""
-    return "~" + path[len(HOME):] if path and path.startswith(HOME + os.sep) else path
+    home = _home(home)
+    return "~" + path[len(home):] if path and path.startswith(home + os.sep) else path
+
+
+def deskflow_log_candidates(info, home=None):
+    """Existing Deskflow log files, most recently modified first."""
+    home = _home(home)
+    pats = [os.path.join(flatpak_data_dir(home), "**", "*.log"),
+            os.path.join(home, ".local/state/Deskflow/**/*.log"),
+            os.path.join(home, ".local/share/Deskflow/**/*.log"),
+            os.path.join(home, ".config/Deskflow/*.log"),
+            os.path.join(home, "deskflow*.log")]
+    files = []
+    for pat in pats:
+        files += glob.glob(pat, recursive=True)
+    conf_file = info.get("log_file")
+    if conf_file and os.path.isfile(conf_file) and not (
+            info.get("kind") == "flatpak" and not conf_file.startswith(flatpak_data_dir(home) + os.sep)):
+        files.append(conf_file)
+    if info.get("kind") == "flatpak":
+        # A Flatpak Deskflow cannot have written logs outside its sandbox.
+        files = [f for f in files if f.startswith(flatpak_data_dir(home) + os.sep)]
+    files = [f for f in dict.fromkeys(files) if os.path.isfile(f)]
+    return sorted(files, key=os.path.getmtime, reverse=True)
+
+
+def _age(path, now=None):
+    try:
+        return max(0.0, (now or time.time()) - os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+def human_age(seconds):
+    if seconds is None:
+        return "never"
+    if seconds < 90:
+        return "%d s ago" % seconds
+    if seconds < 5400:
+        return "%d min ago" % (seconds // 60)
+    if seconds < 172800:
+        return "%d h ago" % (seconds // 3600)
+    return "%d days ago" % (seconds // 86400)
+
+
+def deskflow_log_report(cfg, info=None, home=None, now=None):
+    """Work out which Deskflow log file to follow and explain the situation.
+
+    Returns a dict: path (file to follow or None), state, message, usable
+    (path exists), recommended (path to type into Deskflow), age (seconds since
+    the file was written). States: manual, manual_missing, ok, not_created,
+    outside_sandbox, off, not_installed.
+    """
+    home = _home(home)
+    info = info if info is not None else deskflow_info(home)
+    flatpak = info.get("kind") == "flatpak"
+    rec = recommended_flatpak_log(home) if flatpak else os.path.join(home, "deskflow.log")
+    rep = {"path": None, "state": None, "message": "", "recommended": rec, "age": None, "usable": False}
+    cands = deskflow_log_candidates(info, home)
+
+    def fallback_note(path):
+        return (" Meanwhile following %s (written %s)." % (tilde(path, home), human_age(_age(path, now)))
+                if path else "")
+
+    manual = cfg.get("deskflow", "log_file", fallback="auto").strip()
+    if manual and manual.lower() != "auto":
+        mpath = os.path.expanduser(manual)
+        if os.path.isfile(mpath):
+            rep.update(path=mpath, state="manual",
+                       message="Following %s (custom path set in LG Monitor Switch)." % tilde(mpath, home))
+        else:
+            alt = cands[0] if cands else None
+            rep.update(path=alt or mpath, state="manual_missing",
+                       message="The custom log path %s does not exist. Clear it to use automatic detection."
+                       % tilde(mpath, home) + fallback_note(alt))
+    elif not info.get("installed"):
+        rep.update(state="not_installed", message="Deskflow was not found.")
+    elif info.get("log_to_file") and info.get("log_file"):
+        conf = info["log_file"]
+        if flatpak and not conf.startswith(flatpak_data_dir(home) + os.sep):
+            alt = cands[0] if cands else None
+            rep.update(path=alt, state="outside_sandbox",
+                       message="Deskflow (Flatpak) is set to log to %s, which is outside its sandbox, so "
+                               "nothing is written there. In Deskflow's Settings set the log path to %s."
+                               % (tilde(conf, home), rec) + fallback_note(alt))
+        elif os.path.isfile(conf):
+            rep.update(path=conf, state="ok",
+                       message="Deskflow logs to %s (last written %s)." % (tilde(conf, home),
+                                                                           human_age(_age(conf, now))))
+        else:
+            rep.update(path=conf, state="not_created",
+                       message="Deskflow will log to %s, but the file does not exist yet. Press OK/Apply in "
+                               "Deskflow's settings or restart its server." % tilde(conf, home))
+    else:
+        alt = cands[0] if cands else None
+        rep.update(path=alt, state="off",
+                   message="Deskflow's 'Log to file' is off. In Deskflow's Settings tick 'Log to file' and set "
+                           "the path to %s." % rec + fallback_note(alt))
+    level = (info.get("log_level") or "").upper()
+    if level in QUIET_LOG_LEVELS:
+        rep["message"] += " Deskflow's log level is %s; set it to Info (or more detailed), " \
+                          "otherwise screen switches are not logged." % level.title()
+    if rep["path"]:
+        rep["usable"] = os.path.isfile(rep["path"])
+        rep["age"] = _age(rep["path"], now)
+    return rep
 
 
 def deskflow_log_status(cfg, info=None):
-    """Return (path or None, human readable explanation)."""
-    path = cfg.get("deskflow", "log_file").strip()
-    if path and path != "auto":
-        path = os.path.expanduser(path)
-        return path, ("using %s (set in lg-monitor config)%s" %
-                      (tilde(path), "" if os.path.exists(path) else " - file does not exist yet"))
-    info = info or deskflow_info()
-    if info.get("log_to_file") and info.get("log_file"):
-        path = os.path.expanduser(info["log_file"])
-        if info.get("kind") == "flatpak" and not path.startswith(FLATPAK_DATA_DIR + os.sep):
-            return None, ("Deskflow (Flatpak) logs to %s, which is outside its sandbox, so the file "
-                          "is not visible here. Set Deskflow's log path to %s" % (tilde(path), RECOMMENDED_FLATPAK_LOG))
-        return path, "using Deskflow's log file %s%s" % (
-            tilde(path), "" if os.path.exists(path) else " (not created yet - restart the Deskflow server)")
-    for pattern in (os.path.join(FLATPAK_DATA_DIR, "**/*.log"),
-                    os.path.join(HOME, ".local/state/Deskflow/*.log"),
-                    os.path.join(HOME, ".local/share/Deskflow/*.log")):
-        hits = sorted(glob.glob(pattern, recursive=True), key=os.path.getmtime, reverse=True)
-        if hits:
-            return hits[0], "using the most recent Deskflow log file %s" % tilde(hits[0])
-    return None, ("Deskflow's 'Log to file' is off. In Deskflow open Settings, tick 'Log to file', set the "
-                  "path to %s and press OK/Apply." % (RECOMMENDED_FLATPAK_LOG if info.get("kind") == "flatpak"
-                                                      else "~/deskflow.log"))
+    rep = deskflow_log_report(cfg, info)
+    return rep["path"], rep["message"]
 
 
 def deskflow_log_path(cfg, info=None):
-    return deskflow_log_status(cfg, info)[0]
+    return deskflow_log_report(cfg, info)["path"]
 
 
 def screen_mapping(cfg):
@@ -707,6 +866,25 @@ def screen_mapping(cfg):
         if value in ("", "none", "off"):
             continue
         mapping[screen] = normalize_input(value)
+    return mapping
+
+
+def default_screen_input(cfg, screen, info):
+    """Input used for a Deskflow screen that has no entry in [deskflow.screens]:
+    this computer -> home_input, any other screen -> switch_target."""
+    key = "home_input" if screen == (info or {}).get("local_screen") else "switch_target"
+    return normalize_input(cfg.get("monitor", key))
+
+
+def effective_mapping(cfg, info=None):
+    """Explicit [deskflow.screens] entries plus defaults for screens that
+    Deskflow knows about but the config does not mention yet."""
+    explicit = {k: v.strip().lower() for k, v in cfg.items("deskflow.screens")}
+    mapping = {}
+    for screen in (info or {}).get("screens", []):
+        if screen not in explicit:
+            mapping[screen] = default_screen_input(cfg, screen, info)
+    mapping.update(screen_mapping(cfg))
     return mapping
 
 
@@ -754,6 +932,12 @@ class AutoSwitcher:
         self.pending = None
         self.last_switch = now
 
+    def mark_failed(self, now):
+        """The switch command failed: forget it, but keep `current` unchanged so
+        the next cursor move is not mistaken for 'already there'."""
+        self.pending = None
+        self.last_switch = now
+
     def sync_current(self, value):
         if value and value != self.current:
             self.current = value
@@ -775,7 +959,7 @@ class FileFollower:
         st = os.fstat(fh.fileno())
         if at_end:
             fh.seek(0, os.SEEK_END)
-        self.fh, self.inode = fh, st.st_ino
+        self.fh, self.inode, self.buf = fh, st.st_ino, ""
         return True
 
     def close(self):
@@ -786,15 +970,21 @@ class FileFollower:
     def lines(self, first=False):
         if self.fh is None and not self._open(at_end=first):
             return []
+        out = []
         try:
             st = os.stat(self.path)
             if st.st_ino != self.inode or st.st_size < self.fh.tell():
+                # Rotated or truncated: finish the old file, then start the new one from the top.
+                out += self._read()
                 self.fh.close()
                 self.fh = None
                 if not self._open(at_end=False):
-                    return []
+                    return out
         except OSError:
             pass
+        return out + self._read()
+
+    def _read(self):
         chunk = self.fh.read()
         if not chunk:
             return []
@@ -803,82 +993,259 @@ class FileFollower:
         return complete
 
 
-def cmd_deskflow_watch(cfg, args):
-    log = lambda msg: (sys.stderr.write(time.strftime("%H:%M:%S ") + msg + "\n"), sys.stderr.flush())
-    cfg_mtime = None
+class JournalFollower:
+    """Follow `journalctl --user -f` (or a test command) without blocking."""
 
-    def reload():
-        nonlocal cfg, cfg_mtime
+    def __init__(self, cmd=None):
+        self.proc = subprocess.Popen(cmd or ["journalctl", "--user", "-f", "-n0", "-o", "cat"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.buf = b""
+
+    def lines(self, timeout=0.0):
+        if self.proc.poll() is not None:
+            raise LgError("journal follower exited")
+        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not ready:
+            return []
+        while True:
+            try:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            self.buf += chunk
+        *complete, self.buf = self.buf.split(b"\n")
+        return [c.decode("utf-8", "replace") for c in complete]
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc.stdout.close()
+
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+
+
+def read_watch_state(path=None):
+    """Health of the running watcher, or None. Adds 'alive' (process exists)."""
+    try:
+        with open(path or WATCH_STATE_FILE) as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(int(st.get("pid", 0)), 0)
+        st["alive"] = True
+    except (OSError, ValueError):
+        st["alive"] = False
+    return st
+
+
+class DeskflowWatcher:
+    """The Deskflow auto-switch service.
+
+    Detection (Deskflow install, its settings, which log file to follow, the
+    screen mapping) runs again ONLY when a settings file changes: lg-monitor's
+    config.ini, Deskflow.conf or Deskflow's server config. While no usable log
+    file exists yet it also retries every RETRY_INTERVAL seconds, and stops
+    retrying as soon as one is found.
+    """
+
+    RETRY_INTERVAL = 7.0
+    HEARTBEAT = 15.0
+
+    def __init__(self, dry_run=False, switch_fn=None, log=None, config_path=None, home=None,
+                 state_file=None, journal_cmd=None, state_reader=read_state, clock=time.monotonic,
+                 info_fn=None):
+        self.dry_run = dry_run
+        self.switch_fn = switch_fn or (lambda cfg, target: switch_input(cfg, target, origin="deskflow"))
+        self.log = log or (lambda msg: (sys.stderr.write(time.strftime("%H:%M:%S ") + msg + "\n"),
+                                        sys.stderr.flush()))
+        self.config_path = config_path or CONFIG_FILE
+        self.home = _home(home)
+        self.state_file = state_file or WATCH_STATE_FILE
+        self.journal_cmd = journal_cmd
+        self.state_reader = state_reader
+        self.clock = clock
+        self.info_fn = info_fn or (lambda: deskflow_info(self.home))
+        self.cfg = None
+        self.info = {}
+        self.report = {}
+        self.sw = None
+        self.follower = None
+        self.source = None             # ("file", path) | ("journal", None) | ("none", None)
+        self.mtimes = None
+        self.next_retry = None
+        self.detections = 0
+        self.health = {"pid": os.getpid(), "started": time.time(), "dry_run": dry_run,
+                       "last_line": None, "last_event": None, "last_switch": None}
+        self.last_heartbeat = 0.0
+
+    # ---- settings files ---------------------------------------------------
+    def _watched_files(self):
+        files = [self.config_path] + deskflow_conf_candidates(self.home)
+        if self.info.get("server_config"):
+            files.append(self.info["server_config"])
+        return files
+
+    def _mtimes(self):
+        out = []
+        for f in self._watched_files():
+            try:
+                out.append(os.stat(f).st_mtime_ns)
+            except OSError:
+                out.append(None)
+        return tuple(out)
+
+    # ---- detection --------------------------------------------------------
+    def detect(self, reason):
+        self.detections += 1
+        self.cfg = load_config(self.config_path)
+        self.info = self.info_fn()
+        rep = deskflow_log_report(self.cfg, self.info, self.home)
+        mapping = effective_mapping(self.cfg, self.info)
+        delay = self.cfg.getfloat("deskflow", "delay")
+        cooldown = self.cfg.getfloat("deskflow", "cooldown")
+        if self.sw is None:
+            st = self.state_reader()
+            self.sw = AutoSwitcher(mapping, delay, cooldown, current=(st or {}).get("input") or
+                                   normalize_input(self.cfg.get("monitor", "home_input")))
+            self.log("mapping %s, delay %gs%s" % (mapping or "(empty)", delay, " [dry run]" if self.dry_run else ""))
+        elif (mapping, delay, cooldown) != (self.sw.mapping, self.sw.delay, self.sw.cooldown):
+            self.sw.mapping, self.sw.delay, self.sw.cooldown = mapping, delay, cooldown
+            self.log("settings changed: mapping %s, delay %gs" % (mapping or "(empty)", delay))
+        if rep.get("message") != self.report.get("message"):
+            self.log(rep["message"])
+        self.report = rep
+
+        mode = self.cfg.get("deskflow", "source").strip().lower()
+        if mode == "journal":
+            want = ("journal", None)
+        elif rep["path"]:
+            want = ("file", rep["path"])
+        elif mode == "file":
+            want = ("none", None)
+        else:
+            want = ("journal", None)    # last resort while nothing better exists
+        if want != self.source:
+            self._switch_source(want, reason)
+        # Retry slowly only while there is no usable log file (and the user did
+        # not explicitly ask for the journal).
+        searching = mode != "journal" and not rep["usable"]
+        self.next_retry = self.clock() + self.RETRY_INTERVAL if searching else None
+        self.mtimes = self._mtimes()
+        self._write_health(force=True)
+
+    def _switch_source(self, want, reason):
+        if self.follower is not None:
+            self.follower.close()
+            self.follower = None
+        old = self.source
+        self.source = want
+        kind, path = want
+        if kind == "file":
+            self.follower = FileFollower(path)
+            self.follower.lines(first=True)     # existing file: start at its end
+        elif kind == "journal":
+            self.follower = JournalFollower(self.journal_cmd)
+        desc = {"file": "log file %s" % path, "journal": "the user journal (fallback)",
+                "none": "nothing (no log file yet)"}[kind]
+        self.log("%s %s (%s)" % ("now following" if old else "following", desc, reason))
+
+    # ---- health -----------------------------------------------------------
+    def _write_health(self, force=False):
+        now = time.time()
+        if not force and now - self.last_heartbeat < self.HEARTBEAT:
+            return
+        self.last_heartbeat = now
+        kind, path = self.source or ("none", None)
+        self.health.update(updated=now, source=kind, path=path, state=self.report.get("state"),
+                           message=self.report.get("message"),
+                           searching=self.next_retry is not None,
+                           mapping=self.sw.mapping if self.sw else {})
         try:
-            mtime = os.path.getmtime(CONFIG_FILE)
+            _write_json(self.state_file, self.health)
         except OSError:
-            mtime = 0
-        if mtime != cfg_mtime:
-            cfg_mtime = mtime
-            cfg = load_config()
-            return True
-        return False
+            pass
 
-    reload()
-    st = read_state()
-    sw = AutoSwitcher(screen_mapping(cfg), cfg.getfloat("deskflow", "delay"),
-                      cfg.getfloat("deskflow", "cooldown"),
-                      current=(st or {}).get("input") or normalize_input(cfg.get("monitor", "home_input")))
-    source = cfg.get("deskflow", "source").strip().lower()
-    path, why = deskflow_log_status(cfg)
-    log(why)
-    if source == "file" or (source == "auto" and path):
-        if not path:
-            raise LgError("no Deskflow log file found. In Deskflow open Settings, tick 'Log to file' "
-                          "and Apply, or set [deskflow] log_file in %s" % CONFIG_FILE)
-        log("watching Deskflow log file %s" % path)
-        follower = FileFollower(path)
-        follower.lines(first=True)
-        proc = None
-    else:
-        log("watching the user journal for Deskflow switch lines")
-        proc = subprocess.Popen(["journalctl", "--user", "-f", "-n0", "-o", "cat"],
-                                stdout=subprocess.PIPE, universal_newlines=True, bufsize=1)
-        follower = None
-    log("mapping: %s, delay %.1fs%s" % (sw.mapping or "(empty)", sw.delay, " [dry run]" if args.dry_run else ""))
+    # ---- main loop --------------------------------------------------------
+    def step(self, timeout=0.25):
+        if self.cfg is None:
+            self.detect("start")
+        elif self._mtimes() != self.mtimes:
+            self.detect("settings changed")
+        elif self.next_retry is not None and self.clock() >= self.next_retry:
+            self.detect("retry")
 
+        st = self.state_reader()
+        if st and st.get("origin") != "deskflow":
+            self.sw.sync_current(st.get("input"))
+
+        if isinstance(self.follower, JournalFollower):
+            try:
+                lines = self.follower.lines(timeout)
+            except LgError as exc:
+                self.log(str(exc))
+                self.follower, self.source = None, None
+                lines = []
+        else:
+            if timeout:
+                time.sleep(timeout)
+            lines = self.follower.lines() if self.follower else []
+
+        now = self.clock()
+        for line in lines:
+            ev = self.sw.on_line(line, now)
+            if ev:
+                self.log("cursor -> %s: %s" % (ev[1], ev[0]))
+                self.health["last_line"] = time.time()
+                self.health["last_event"] = "%s -> %s" % (ev[1], ev[0])
+                self._write_health(force=True)
+        target = self.sw.due(self.clock())
+        if target:
+            self.log("switching monitor to %s%s" % (target, " (dry run)" if self.dry_run else ""))
+            ok = True
+            if not self.dry_run:
+                try:
+                    self.switch_fn(self.cfg, target)
+                except LgError as exc:
+                    ok = False
+                    self.log("switch failed: %s" % exc)
+            if ok:
+                self.sw.mark_switched(target, self.clock())
+            else:
+                self.sw.mark_failed(self.clock())
+            self.health["last_switch"] = {"time": time.time(), "input": target, "ok": ok}
+            self._write_health(force=True)
+        self._write_health()
+        return lines
+
+    def close(self):
+        if self.follower is not None:
+            self.follower.close()
+            self.follower = None
+
+
+def cmd_deskflow_watch(cfg, args):
+    watcher = DeskflowWatcher(dry_run=args.dry_run)
     try:
         while True:
-            if reload():
-                sw.mapping = screen_mapping(cfg)
-                sw.delay = cfg.getfloat("deskflow", "delay")
-                sw.cooldown = cfg.getfloat("deskflow", "cooldown")
-                log("config reloaded: mapping %s, delay %.1fs" % (sw.mapping, sw.delay))
-            st = read_state()
-            if st and st.get("origin") != "deskflow":
-                sw.sync_current(st.get("input"))
-            if proc is not None:
-                ready, _, _ = select.select([proc.stdout], [], [], 0.25)
-                lines = [proc.stdout.readline()] if ready else []
-                if proc.poll() is not None:
-                    raise LgError("journalctl exited")
-            else:
-                time.sleep(0.25)
-                lines = follower.lines()
-            now = time.monotonic()
-            for line in lines:
-                ev = sw.on_line(line, now)
-                if ev:
-                    log("cursor -> %s: %s" % (ev[1], ev[0]))
-            target = sw.due(time.monotonic())
-            if target:
-                log("switching monitor to %s" % target)
-                if not args.dry_run:
-                    try:
-                        switch_input(cfg, target, origin="deskflow")
-                    except LgError as exc:
-                        log("switch failed: %s" % exc)
-                sw.mark_switched(target, time.monotonic())
+            watcher.step()
     except KeyboardInterrupt:
         return 0
     finally:
-        if proc is not None:
-            proc.terminate()
+        watcher.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1083,7 +1450,11 @@ def main(argv=None):
             return cmd_deskflow_watch(cfg, args)
         elif args.cmd == "deskflow-info":
             info = deskflow_info()
-            info["resolved_log_file"], info["log_status"] = deskflow_log_status(cfg, info)
+            rep = deskflow_log_report(cfg, info)
+            info["log"] = rep
+            info["mapping"] = effective_mapping(cfg, info)
+            info["auto_switch_enabled"] = feature_enabled(cfg, "deskflow")
+            info["watcher"] = read_watch_state()
             print(json.dumps(info, indent=2))
         elif args.cmd == "service":
             set_feature(cfg, args.feature, args.state == "on")

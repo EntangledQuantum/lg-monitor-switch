@@ -16,7 +16,7 @@ mkdir -p "$OUT" "$T/config/lg-monitor" "$T/data/gnome-shell/extensions" "$T/run"
 chmod 700 "$T/run"
 cp -r "$ROOT/linux/extension/$UUID" "$T/data/gnome-shell/extensions/"
 cp -r "$ROOT/tests/shell-harness/lgm-test-harness@local" "$T/data/gnome-shell/extensions/"
-[ -f "$HOME/.config/lg-monitor/config.ini" ] && cp "$HOME/.config/lg-monitor/config.ini" "$T/config/lg-monitor/"
+[ "${LGM_DEMO:-0}" != 1 ] && [ -f "$HOME/.config/lg-monitor/config.ini" ] && cp "$HOME/.config/lg-monitor/config.ini" "$T/config/lg-monitor/"
 export XDG_CONFIG_HOME="$T/config" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/run" LGM_HARNESS_OUT="$OUT"
 if [ "${LGM_DEMO:-0}" = 1 ]; then
   # Fake home with a fake Deskflow config + a hostname shim, so screenshots
@@ -40,7 +40,7 @@ cp "$ROOT/assets/lg-monitor-switch.svg" "$T/data/icons/hicolor/scalable/apps/io.
   gsettings set org.gnome.shell disabled-extensions "[\"ding@rastersoft.com\", \"ubuntu-dock@ubuntu.com\"]"
   gsettings set org.gnome.desktop.background picture-options none
   gsettings set org.gnome.desktop.background primary-color "#2b3a55"
-  gnome-shell --headless --wayland --no-x11 --virtual-monitor 1400x1700 > "'"$OUT"'/shell.log" 2>&1 &
+  gnome-shell --headless --wayland --no-x11 --virtual-monitor 1400x2100 > "'"$OUT"'/shell.log" 2>&1 &
   SHELL_PID=$!
   sleep 15
   WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=wayland '"$ROOT"'/linux/lg-monitor-settings > "'"$OUT"'/settings.log" 2>&1 &

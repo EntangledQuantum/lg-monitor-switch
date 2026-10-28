@@ -278,3 +278,284 @@ class DeskflowFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Deskflow detection and the watcher (v1.0.1). Everything runs in a temporary
+# fake HOME; switches go to a recording fake, never to the monitor.
+# ---------------------------------------------------------------------------
+
+FP = ".var/app/org.deskflow.deskflow"
+
+
+def write(path, text, bump=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(text)
+    if bump is not None:  # make mtime changes visible even within one clock tick
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + bump * 1_000_000_000))
+
+
+def append(path, text):
+    with open(path, "a") as fh:
+        fh.write(text)
+
+
+def deskflow_conf(log_file=None, to_file=True, level="INFO", local="linux-pc"):
+    return ("[core]\ncomputerName=%s\n\n[computer_win]\nname=windows-pc\n\n[log]\nfile=%s\nlevel=%s\n"
+            "toFile=%s\n" % (local, log_file or "", level, "true" if to_file else "false"))
+
+
+def sw_line(a, b):
+    return '[2026-10-29T10:00:00] INFO: switch from "%s" to "%s" at 10,10\n' % (a, b)
+
+
+class DeskflowDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.cfg = lg.new_config()
+        self.fpconf = os.path.join(self.home, FP, "config/Deskflow/Deskflow.conf")
+        self.fplog = os.path.join(self.home, FP, "data/deskflow.log")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def report(self, running="flatpak"):
+        info = lg.deskflow_info(self.home, running=running)
+        return info, lg.deskflow_log_report(self.cfg, info, self.home)
+
+    def test_flatpak_ok(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        write(self.fplog, "x\n")
+        info, rep = self.report()
+        self.assertEqual(info["screens"], ["linux-pc", "windows-pc"])
+        self.assertEqual((rep["state"], rep["path"], rep["usable"]), ("ok", self.fplog, True))
+
+    def test_flatpak_outside_sandbox_without_fallback(self):
+        write(self.fpconf, deskflow_conf(os.path.join(self.home, "deskflow.log")))
+        write(os.path.join(self.home, "deskflow.log"), "stale host file\n")  # not written by the Flatpak
+        _, rep = self.report()
+        self.assertEqual((rep["state"], rep["path"]), ("outside_sandbox", None))
+        self.assertIn(self.fplog, rep["message"])
+        self.assertEqual(rep["recommended"], self.fplog)
+
+    def test_flatpak_outside_sandbox_falls_back_to_recent_log(self):
+        write(self.fpconf, deskflow_conf(os.path.join(self.home, "deskflow.log")))
+        old = os.path.join(self.home, FP, "cache/old.log")
+        write(old, "old\n", bump=-100)
+        write(self.fplog, "newer\n")
+        _, rep = self.report()
+        self.assertEqual((rep["state"], rep["path"]), ("outside_sandbox", self.fplog))
+        self.assertIn("Meanwhile following", rep["message"])
+
+    def test_log_to_file_off(self):
+        write(self.fpconf, deskflow_conf(self.fplog, to_file=False))
+        _, rep = self.report()
+        self.assertEqual((rep["state"], rep["path"]), ("off", None))
+        self.assertIn("'Log to file' is off", rep["message"])
+
+    def test_not_created_yet(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        _, rep = self.report()
+        self.assertEqual((rep["state"], rep["path"], rep["usable"]), ("not_created", self.fplog, False))
+
+    def test_quiet_log_level_warning(self):
+        write(self.fpconf, deskflow_conf(self.fplog, level="WARNING"))
+        _, rep = self.report()
+        self.assertIn("log level is Warning", rep["message"])
+
+    def test_manual_path_missing_falls_back(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        write(self.fplog, "x\n")
+        self.cfg.set("deskflow", "log_file", os.path.join(self.home, "nope.log"))
+        _, rep = self.report()
+        self.assertEqual((rep["state"], rep["path"]), ("manual_missing", self.fplog))
+        self.cfg.set("deskflow", "log_file", "")  # empty means automatic
+        self.assertEqual(self.report()[1]["state"], "ok")
+
+    def test_native_install(self):
+        conf = os.path.join(self.home, ".config/Deskflow/Deskflow.conf")
+        log = os.path.join(self.home, "deskflow.log")
+        write(conf, deskflow_conf(log))
+        write(log, "x\n")
+        info, rep = self.report(running="native")
+        self.assertEqual((info["kind"], info["config"]), ("native", conf))
+        self.assertEqual((rep["state"], rep["path"]), ("ok", log))
+        self.assertEqual(rep["recommended"], log)
+
+    def test_both_configs_prefer_running_kind(self):
+        native = os.path.join(self.home, ".config/Deskflow/Deskflow.conf")
+        write(native, deskflow_conf(os.path.join(self.home, "deskflow.log")), bump=50)
+        write(self.fpconf, deskflow_conf(self.fplog))
+        self.assertEqual(lg.deskflow_info(self.home, running="flatpak")["config"], self.fpconf)
+        self.assertEqual(lg.deskflow_info(self.home, running="native")["config"], native)
+
+    def test_appimage_detected(self):
+        write(os.path.join(self.home, "Applications/Deskflow-1.27.0-x86_64.AppImage"), "")
+        self.assertIn("appimage", [k for k, _ in lg.deskflow_installs(self.home)])
+
+    def test_effective_mapping_defaults(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        info = lg.deskflow_info(self.home, running="flatpak")
+        self.assertEqual(lg.effective_mapping(self.cfg, info), {"linux-pc": "dp1", "windows-pc": "hdmi2"})
+        self.cfg.set("deskflow.screens", "windows-pc", "none")
+        self.cfg.set("deskflow.screens", "laptop", "hdmi1")
+        self.assertEqual(lg.effective_mapping(self.cfg, info), {"linux-pc": "dp1", "laptop": "hdmi1"})
+
+    def test_rotation_by_rename(self):
+        f = lg.FileFollower(self.fplog)
+        write(self.fplog, "")
+        f.lines(first=True)
+        append(self.fplog, "a\nb")
+        self.assertEqual(f.lines(), ["a"])
+        append(self.fplog, "\n")
+        os.rename(self.fplog, self.fplog + ".1")
+        write(self.fplog, "c\n")
+        self.assertEqual(f.lines(), ["b", "c"])
+        f.close()
+
+
+class WatcherTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.cfgpath = os.path.join(self.home, "lgcfg/config.ini")
+        self.fpconf = os.path.join(self.home, FP, "config/Deskflow/Deskflow.conf")
+        self.fplog = os.path.join(self.home, FP, "data/deskflow.log")
+        self.journal = os.path.join(self.home, "fake-journal")
+        write(self.journal, "")
+        write(self.cfgpath, "[deskflow]\ndelay = 0\ncooldown = 0\n")
+        self.switched, self.logs = [], []
+        self.now = [1000.0]
+        self.w = None
+
+    def tearDown(self):
+        if self.w:
+            self.w.close()
+        self.tmp.cleanup()
+
+    def start(self):
+        self.w = lg.DeskflowWatcher(
+            switch_fn=lambda cfg, t: self.switched.append(t), log=self.logs.append,
+            config_path=self.cfgpath, home=self.home, state_file=os.path.join(self.home, "watch.json"),
+            journal_cmd=["tail", "-n0", "-F", self.journal], state_reader=lambda: None,
+            clock=lambda: self.now[0], info_fn=lambda: lg.deskflow_info(self.home, running="flatpak"))
+        self.w.step(0)
+        return self.w
+
+    def steps(self, n=3, timeout=0.05):
+        for _ in range(n):
+            self.w.step(timeout)
+
+    def test_file_appears_after_startup(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        w = self.start()
+        self.assertEqual(w.source, ("file", self.fplog))
+        self.assertIsNotNone(w.next_retry)          # not usable yet -> retrying
+        write(self.fplog, "Deskflow server started\n" + sw_line("linux-pc", "windows-pc"))
+        self.steps()
+        self.assertEqual(self.switched, ["hdmi2"])
+        self.now[0] += 10                            # retry interval passes
+        self.steps(1)
+        self.assertIsNone(w.next_retry)              # found -> retrying stops
+
+    def test_no_redetection_while_working(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        write(self.fplog, "x\n")
+        w = self.start()
+        self.assertIsNone(w.next_retry)
+        for _ in range(5):
+            self.now[0] += 60
+            w.step(0)
+        self.assertEqual(w.detections, 1)
+        with open(os.path.join(self.home, "watch.json")) as fh:
+            self.assertEqual(json.load(fh)["source"], "file")
+
+    def test_deskflow_log_path_changes_while_running(self):
+        other = os.path.join(self.home, FP, "data/other.log")
+        write(self.fplog, "")
+        write(other, "")
+        write(self.fpconf, deskflow_conf(self.fplog))
+        w = self.start()
+        self.assertEqual(w.source, ("file", self.fplog))
+        write(self.fpconf, deskflow_conf(other), bump=5)   # user changes Deskflow's log path
+        w.step(0)
+        self.assertEqual(w.source, ("file", other))
+        self.assertTrue(any("settings changed" in m for m in self.logs))
+        append(self.fplog, sw_line("linux-pc", "windows-pc"))   # old file: ignored now
+        self.steps()
+        self.assertEqual(self.switched, [])
+        append(other, sw_line("linux-pc", "windows-pc"))
+        self.steps()
+        self.assertEqual(self.switched, ["hdmi2"])
+
+    def test_journal_to_file_transition(self):
+        write(self.cfgpath, "[deskflow]\ndelay = 0\ncooldown = 0\n[deskflow.screens]\nwindows-pc = hdmi2\n"
+                            "linux-pc = dp1\n")
+        w = self.start()                              # no Deskflow config at all -> journal fallback
+        self.assertEqual(w.source, ("journal", None))
+        self.assertIsNotNone(w.next_retry)
+        import time as _t
+        _t.sleep(0.3)                                 # let the fake journal (tail -F) start
+        append(self.journal, "unrelated\n" + sw_line("linux-pc", "windows-pc"))
+        for _ in range(30):
+            w.step(0.1)
+            if self.switched:
+                break
+        self.assertEqual(self.switched, ["hdmi2"])    # journal lines work
+        write(self.fpconf, deskflow_conf(self.fplog))  # Deskflow configured later
+        write(self.fplog, "")
+        w.step(0)
+        self.assertEqual(w.source, ("file", self.fplog))
+        self.assertIsNone(w.next_retry)
+        append(self.fplog, sw_line("windows-pc", "linux-pc"))
+        self.steps()
+        self.assertEqual(self.switched, ["hdmi2", "dp1"])
+
+    def test_outside_sandbox_then_fixed(self):
+        write(self.fpconf, deskflow_conf(os.path.join(self.home, "deskflow.log")))
+        w = self.start()
+        self.assertEqual(w.report["state"], "outside_sandbox")
+        self.assertEqual(w.source, ("journal", None))
+        write(self.fpconf, deskflow_conf(self.fplog), bump=5)   # user fixes the path in Deskflow
+        w.step(0)
+        self.assertEqual((w.report["state"], w.source), ("not_created", ("file", self.fplog)))
+        write(self.fplog, sw_line("windows-pc", "linux-pc"))
+        self.steps()
+        self.assertEqual(self.switched, [])            # already on dp1 (home input)
+        append(self.fplog, sw_line("linux-pc", "windows-pc") + sw_line("windows-pc", "linux-pc"))
+        self.steps()
+        self.assertEqual(self.switched, [])            # came back before the delay -> nothing
+        append(self.fplog, sw_line("linux-pc", "windows-pc"))
+        self.steps()
+        self.assertEqual(self.switched, ["hdmi2"])
+
+    def test_lg_config_change_applies_without_restart(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        write(self.fplog, "")
+        w = self.start()
+        write(self.cfgpath, "[deskflow]\ndelay = 0\ncooldown = 0\n[deskflow.screens]\nwindows-pc = hdmi1\n",
+              bump=5)
+        w.step(0)
+        self.assertEqual(w.sw.mapping["windows-pc"], "hdmi1")
+        append(self.fplog, sw_line("linux-pc", "windows-pc"))
+        self.steps()
+        self.assertEqual(self.switched, ["hdmi1"])
+
+    def test_failed_switch_is_not_remembered(self):
+        write(self.fpconf, deskflow_conf(self.fplog))
+        write(self.fplog, "")
+        w = self.start()
+
+        def boom(cfg, t):
+            raise lg.LgError("i2c error")
+        w.switch_fn = boom
+        append(self.fplog, sw_line("linux-pc", "windows-pc"))
+        self.steps()
+        self.assertEqual(w.sw.current, "dp1")
+        w.switch_fn = lambda cfg, t: self.switched.append(t)
+        append(self.fplog, sw_line("windows-pc", "linux-pc") + sw_line("linux-pc", "windows-pc"))
+        self.steps()
+        self.assertEqual(self.switched, ["hdmi2"])

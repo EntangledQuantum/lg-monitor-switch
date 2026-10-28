@@ -222,16 +222,26 @@ If [Deskflow](https://github.com/deskflow/deskflow) is installed (native or Flat
 
 lg-monitor **never changes Deskflow's settings**. It only reads Deskflow's log, where the Deskflow server writes
 lines like `switch from "linux-pc" to "windows-pc" at 1919,540`. Deskflow's **Log to file** option has to be on,
-and you need to turn it on yourself:
+and you need to turn it on yourself (once):
 
-1. Deskflow → **Settings**. In the *Log* section tick **Log to file** and keep the level at *Info* or higher.
-2. Set the log path. For the **Flatpak** version use
-   `~/.var/app/org.deskflow.deskflow/data/deskflow.log` (written as a full path, e.g. `/home/you/.var/...`).
-   The Flatpak sandbox can't write elsewhere in your home folder. For a native install any path works,
-   e.g. `~/deskflow.log`.
-3. Press OK, then stop and start the Deskflow server once.
+1. Deskflow → **Settings**. In the *Log* section tick **Log to file** and keep the level at *Info* or more detailed
+   (*Note*, *Warning* and *Error* hide screen switches).
+2. Set the log path. The settings app shows the right one with a **copy** button:
+   - **Flatpak**: `/home/<you>/.var/app/org.deskflow.deskflow/data/deskflow.log`. The sandbox **cannot** write
+     anywhere else in your home folder. Deskflow's default `~/deskflow.log` silently produces no file.
+   - **Native package / AppImage**: any path works, e.g. `/home/<you>/deskflow.log`.
+3. Press OK/Apply.
 
-The settings app shows whether the log file was found and lets you map each Deskflow screen to an input.
+You don't need to restart anything afterwards. The auto-switch service re-reads its settings whenever Deskflow's
+settings file or `~/.config/lg-monitor/config.ini` changes (including changes made in the settings app). While no
+usable log file exists yet, it checks again every few seconds and stops checking once it finds one. Detection
+covers the Flatpak (system and user installs), native packages (`/usr/bin`, `/usr/local/bin`,
+`~/.config/Deskflow`) and AppImages in `~/Applications`, `~/.local/bin`, `~/bin` or `~/Downloads`.
+
+The settings app shows the live state of the log file (on and updating / Flatpak path outside the sandbox /
+*Log to file* off), which file the service is following and when it last saw the cursor change screens. You can
+map each Deskflow screen to an input; screens without a mapping use *this computer → its own input, any other
+screen → the Switch target*. From a terminal: `lg-monitor deskflow-info` (look at `log` and `watcher`).
 
 > **⚠ Use only one automatic switcher.** While Deskflow auto-switch is on, do **not** also use the Windows app's
 > "Switch to Linux" button or any Windows-side automatic switching. Both sides could fight over the input. Manual
@@ -306,7 +316,8 @@ It contains the token, so don't share it.
 | Windows: "Linux listener … unable to connect" | Is the listener running (`systemctl --user status lg-monitor-listener`)? Firewall (`ufw`)? Right IP and port? Same LAN? |
 | Windows: 401 | The token doesn't match. Copy `lg-monitor token` again. |
 | Windows: `DDC/CI read … failed` | Pick the right monitor (`-ListMonitors`), turn on DDC/CI in the OSD, try another cable/port. Some docks/KVMs block DDC. |
-| Deskflow auto-switch never fires | Settings app → Deskflow log file row. Turn on *Log to file* in Deskflow (path inside `~/.var/app/org.deskflow.deskflow/` for Flatpak), check the screen mapping, and watch `journalctl --user -u lg-monitor-deskflow -f`. |
+| Deskflow auto-switch never fires | Run `lg-monitor deskflow-info`. `log.state` should be `ok`, and `watcher.source` should be `file` with a recent `last_event`. `outside_sandbox`: the Flatpak's log path must be inside `~/.var/app/org.deskflow.deskflow/` (copy the path from the settings app). `off`: tick *Log to file* in Deskflow. `not_created`: press OK/Apply in Deskflow's settings. Also check the screen mapping, and watch `journalctl --user -u lg-monitor-deskflow -f`. No restart of the service is needed after fixing settings. |
+| Deskflow log exists but nothing is logged on screen changes | Deskflow's log level is *Note*, *Warning* or *Error*. Set it to *Info* (or *Debug*). |
 
 ## Development
 
