@@ -1,0 +1,1108 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""lg-monitor - control an LG UltraGear monitor (brightness, contrast, input)
+over DDC/CI from Linux.
+
+Only three things are ever written to the monitor:
+  * VCP 0x10 (brightness, 0-100)
+  * VCP 0x12 (contrast, 0-100)
+  * the input switch, sent as an LG manufacturer packet (register 0xF4,
+    source address 0x50) because this monitor ignores the standard VCP 0x60.
+
+Uses only the Python standard library plus the system tools `ddcutil` and
+`i2ctransfer` (package i2c-tools). Run with /usr/bin/python3.
+"""
+
+import argparse
+import configparser
+import contextlib
+import fcntl
+import glob
+import hmac
+import ipaddress
+import json
+import os
+import re
+import secrets
+import select
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+VERSION = "1.0.0"
+APP_ID = "io.github.entangledquantum.LgMonitorSwitch"
+
+# ---------------------------------------------------------------------------
+# Monitor protocol constants
+# ---------------------------------------------------------------------------
+
+DDC_ADDR = 0x37            # DDC/CI 7-bit slave address of the monitor
+LG_SOURCE_ADDR = 0x50      # LG side-channel uses source 0x50 instead of 0x51
+LG_INPUT_REGISTER = 0xF4   # LG manufacturer "input select" register
+SET_VCP_OPCODE = 0x03
+
+# Value written to register 0xF4 for each input (LG UltraGear family).
+INPUTS = {"dp1": 0xD0, "dp2": 0xD1, "hdmi1": 0x90, "hdmi2": 0x91}
+INPUT_LABELS = {
+    "dp1": "DisplayPort",
+    "dp2": "DisplayPort 2",
+    "hdmi1": "HDMI 1",
+    "hdmi2": "HDMI 2",
+}
+INPUT_ALIASES = {"dp": "dp1", "displayport": "dp1", "hdmi": "hdmi1"}
+
+# The ONLY VCP codes this program will ever write.
+WRITABLE_VCP = {0x10: "brightness", 0x12: "contrast"}
+
+# ---------------------------------------------------------------------------
+# Paths and configuration
+# ---------------------------------------------------------------------------
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "lg-monitor")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
+TOKEN_FILE = os.path.join(CONFIG_DIR, "token")
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "lg-monitor-%d" % os.getuid())
+BUS_CACHE_FILE = os.path.join(RUNTIME_DIR, "bus")
+STATE_FILE = os.path.join(RUNTIME_DIR, "state.json")
+LOCK_FILE = os.path.join(RUNTIME_DIR, "ddc.lock")
+
+LISTENER_UNIT = "lg-monitor-listener.service"
+DESKFLOW_UNIT = "lg-monitor-deskflow.service"
+
+DEFAULTS = {
+    "general": {
+        # Start the enabled background services (listener, Deskflow watcher)
+        # automatically at login via systemd --user.
+        "autostart": "true",
+    },
+    "monitor": {
+        # "auto" = find the monitor with `ddcutil detect`; or an I2C bus number.
+        "bus": "auto",
+        # Used by auto-detection: EDID manufacturer id and a model substring.
+        "mfg": "GSM",
+        "model": "LG ULTRAGEAR",
+        # The input THIS Linux computer is connected to.
+        "home_input": "dp1",
+        # Where the "Switch" button sends the monitor (the other computer).
+        "switch_target": "hdmi2",
+        # Human name of the other computer, used for the button label.
+        "switch_target_name": "Windows",
+    },
+    "listener": {
+        # Opt-in. Use `lg-monitor service listener on` or the settings app.
+        "enabled": "false",
+        "bind": "0.0.0.0",
+        "port": "47320",
+        # "private" = only accept clients from private/link-local/loopback
+        # addresses; "any" = accept every address (token still required).
+        "allow": "private",
+    },
+    "deskflow": {
+        # Opt-in. Use `lg-monitor service deskflow on` or the settings app.
+        "enabled": "false",
+        # Seconds to wait after the cursor moves before switching.
+        "delay": "5",
+        # Minimum seconds between two automatic switches.
+        "cooldown": "2",
+        # "auto" = read Deskflow's "Log to file" path from its settings,
+        # otherwise an explicit path to the Deskflow log file.
+        "log_file": "auto",
+        # "auto" (log file if found, else journal), "file" or "journal".
+        "source": "auto",
+    },
+    # Deskflow screen name -> input. Empty / "none" = do nothing.
+    "deskflow.screens": {},
+}
+
+
+class LgError(Exception):
+    """User-facing error."""
+
+
+def new_config():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.optionxform = str  # keep the case of Deskflow screen names
+    cfg.read_dict(DEFAULTS)
+    return cfg
+
+
+def load_config(path=None):
+    cfg = new_config()
+    path = path or CONFIG_FILE
+    if os.path.exists(path):
+        try:
+            cfg.read(path, encoding="utf-8")
+        except configparser.Error as exc:
+            raise LgError("cannot parse %s: %s" % (path, exc))
+    return cfg
+
+
+def save_config(cfg, path=None):
+    path = path or CONFIG_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("# lg-monitor configuration (see config.example.ini for documentation)\n")
+        cfg.write(fh)
+    os.replace(tmp, path)
+
+
+def normalize_input(name):
+    key = (name or "").strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+    key = INPUT_ALIASES.get(key, key)
+    if key not in INPUTS:
+        raise LgError("unknown input %r (use one of: %s)" % (name, ", ".join(sorted(INPUTS))))
+    return key
+
+
+def find_tool(name):
+    path = shutil.which(name) or shutil.which(name, path="/usr/sbin:/sbin:/usr/bin:/bin:/usr/local/sbin:/usr/local/bin")
+    if not path:
+        pkg = "i2c-tools" if name.startswith("i2c") else name
+        raise LgError("'%s' not found. Install it with: sudo apt install %s" % (name, pkg))
+    return path
+
+
+def ensure_runtime_dir():
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+
+
+@contextlib.contextmanager
+def ddc_lock():
+    """Serialise all DDC traffic between the CLI, extension and services."""
+    ensure_runtime_dir()
+    with open(LOCK_FILE, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def run(cmd, timeout=15):
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise LgError("timeout running %s" % " ".join(cmd))
+    if res.returncode != 0:
+        msg = (res.stderr.strip() or res.stdout.strip() or "exit code %d" % res.returncode)
+        raise LgError("%s failed: %s" % (os.path.basename(cmd[0]), msg))
+    return res.stdout
+
+
+# ---------------------------------------------------------------------------
+# Bus detection
+# ---------------------------------------------------------------------------
+
+def parse_detect(text, mfg="GSM", model="LG ULTRAGEAR"):
+    """Parse `ddcutil detect --brief` output and return the I2C bus number of
+    the first display whose monitor id matches mfg and contains model."""
+    candidates = []
+    for block in re.split(r"\n(?=\S)", text):
+        bus = re.search(r"I2C bus:\s*/dev/i2c-(\d+)", block)
+        mon = re.search(r"Monitor:\s*([^:\n]*):([^:\n]*):", block)
+        if not bus or not mon:
+            continue
+        if mon.group(1).strip().upper() != mfg.strip().upper():
+            continue
+        if model.strip().upper() not in mon.group(2).strip().upper():
+            continue
+        valid = block.lstrip().startswith("Display")
+        candidates.append((0 if valid else 1, int(bus.group(1))))
+    if not candidates:
+        return None
+    return sorted(candidates)[0][1]
+
+
+def detect_bus(cfg, use_cache=True):
+    bus = cfg.get("monitor", "bus").strip().lower()
+    if bus not in ("", "auto"):
+        if not bus.isdigit():
+            raise LgError("[monitor] bus must be 'auto' or a number, got %r" % bus)
+        return int(bus)
+    if use_cache:
+        try:
+            with open(BUS_CACHE_FILE) as fh:
+                cached = int(fh.read().strip())
+            if os.path.exists("/dev/i2c-%d" % cached):
+                return cached
+        except (OSError, ValueError):
+            pass
+    out = run([find_tool("ddcutil"), "detect", "--brief"], timeout=30)
+    found = parse_detect(out, cfg.get("monitor", "mfg"), cfg.get("monitor", "model"))
+    if found is None:
+        raise LgError("monitor %s/%s not found by 'ddcutil detect'. Is DDC/CI enabled in the "
+                      "monitor OSD and do you have access to /dev/i2c-*?" %
+                      (cfg.get("monitor", "mfg"), cfg.get("monitor", "model")))
+    ensure_runtime_dir()
+    with open(BUS_CACHE_FILE, "w") as fh:
+        fh.write(str(found))
+    return found
+
+
+def forget_bus_cache():
+    with contextlib.suppress(OSError):
+        os.unlink(BUS_CACHE_FILE)
+
+
+def with_bus(cfg, fn):
+    """Run fn(bus); if the cached bus fails, re-detect once and retry."""
+    auto = cfg.get("monitor", "bus").strip().lower() in ("", "auto")
+    bus = detect_bus(cfg)
+    try:
+        return fn(bus)
+    except LgError:
+        if not auto:
+            raise
+        forget_bus_cache()
+        new_bus = detect_bus(cfg, use_cache=False)
+        if new_bus == bus:
+            raise
+        return fn(new_bus)
+
+
+# ---------------------------------------------------------------------------
+# Brightness / contrast (standard MCCS via ddcutil)
+# ---------------------------------------------------------------------------
+
+def parse_getvcp(text):
+    """Parse `ddcutil getvcp ... --brief` lines like 'VCP 10 C 94 100'."""
+    values = {}
+    for line in text.splitlines():
+        m = re.match(r"VCP\s+([0-9A-Fa-f]{2})\s+C\s+(\d+)\s+(\d+)", line.strip())
+        if m:
+            values[int(m.group(1), 16)] = (int(m.group(2)), int(m.group(3)))
+    return values
+
+
+def check_level(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        ivalue = value
+    elif isinstance(value, str) and re.fullmatch(r"\s*\d{1,3}\s*", value):
+        ivalue = int(value)
+    else:
+        raise LgError("value must be an integer 0-100, got %r" % (value,))
+    if not 0 <= ivalue <= 100:
+        raise LgError("value must be between 0 and 100, got %d" % ivalue)
+    return ivalue
+
+
+def _read_vcp(bus, codes, attempts=3):
+    """Read VCP codes (caller holds the lock). The monitor occasionally drops a
+    reply, so retry a few times."""
+    err = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(0.2)
+        try:
+            out = run([find_tool("ddcutil"), "--bus", str(bus), "getvcp"] +
+                      ["%02x" % c for c in codes] + ["--brief"])
+        except LgError as exc:
+            err = exc
+            continue
+        vals = parse_getvcp(out)
+        if all(c in vals for c in codes):
+            return vals
+        err = LgError("could not read VCP %s: %s" % (" ".join("%02x" % c for c in codes), out.strip()))
+    raise err
+
+
+def get_levels(cfg):
+    def read(bus):
+        with ddc_lock():
+            vals = _read_vcp(bus, [0x10, 0x12])
+        return {"brightness": vals[0x10][0], "contrast": vals[0x12][0]}
+    return with_bus(cfg, read)
+
+
+def set_vcp(cfg, code, value):
+    if code not in WRITABLE_VCP:  # hard safety net - never write anything else
+        raise LgError("refusing to write VCP 0x%02X" % code)
+    value = check_level(value)
+
+    def write(bus):
+        # The 32GN650 silently drops a write now and then, and ddcutil's own
+        # verification reads back too early. So: write, wait, read back, retry.
+        with ddc_lock():
+            for attempt in range(3):
+                run([find_tool("ddcutil"), "--bus", str(bus), "--noverify",
+                     "setvcp", "%02x" % code, str(value)])
+                time.sleep(0.12 + 0.1 * attempt)
+                try:
+                    if _read_vcp(bus, [code], attempts=2)[code][0] == value:
+                        return value
+                except LgError:
+                    pass
+        raise LgError("monitor did not accept %s=%d (DDC write not confirmed)" % (WRITABLE_VCP[code], value))
+    return with_bus(cfg, write)
+
+
+# ---------------------------------------------------------------------------
+# Input switching (LG side-channel)
+# ---------------------------------------------------------------------------
+
+def lg_input_packet(value):
+    """Build the 7-byte DDC/CI "Set VCP Feature" packet for LG register 0xF4,
+    sent with source address 0x50. The checksum is the XOR of the destination
+    address byte (0x37 << 1 = 0x6E) and all preceding packet bytes."""
+    if value not in INPUTS.values():
+        raise LgError("refusing to send unknown input value 0x%02X" % value)
+    body = [LG_SOURCE_ADDR, 0x80 | 4, SET_VCP_OPCODE, LG_INPUT_REGISTER, 0x00, value]
+    chk = DDC_ADDR << 1
+    for b in body:
+        chk ^= b
+    return body + [chk]
+
+
+def write_state(input_key, origin):
+    ensure_runtime_dir()
+    state = {"input": input_key, "time": time.time(), "origin": origin}
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, STATE_FILE)
+
+
+def read_state():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def switch_input(cfg, name=None, origin="cli"):
+    if name in (None, "", "target"):
+        name = cfg.get("monitor", "switch_target")
+    elif name == "home":
+        name = cfg.get("monitor", "home_input")
+    key = normalize_input(name)
+    packet = lg_input_packet(INPUTS[key])
+
+    def send(bus):
+        cmd = [find_tool("i2ctransfer"), "-y", str(bus), "w%d@0x%02x" % (len(packet), DDC_ADDR)]
+        cmd += ["0x%02x" % b for b in packet]
+        with ddc_lock():
+            run(cmd)
+        return key
+    with_bus(cfg, send)
+    write_state(key, origin)
+    return key
+
+
+# ---------------------------------------------------------------------------
+# Token
+# ---------------------------------------------------------------------------
+
+def read_token():
+    try:
+        with open(TOKEN_FILE) as fh:
+            tok = fh.read().strip()
+    except OSError:
+        return None
+    return tok if len(tok) >= 16 else None
+
+
+def ensure_token(regenerate=False):
+    tok = None if regenerate else read_token()
+    if tok:
+        return tok
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tok = secrets.token_urlsafe(24)
+    old = os.umask(0o077)
+    try:
+        tmp = TOKEN_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(tok + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, TOKEN_FILE)
+    finally:
+        os.umask(old)
+    return tok
+
+
+# ---------------------------------------------------------------------------
+# LAN listener
+# ---------------------------------------------------------------------------
+
+MAX_BODY = 256
+
+
+def client_allowed(addr, policy):
+    if policy == "any":
+        return True
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+class Backend:
+    """What the listener calls; replaced by a fake in the tests."""
+
+    def status(self, cfg):
+        return get_levels(cfg)
+
+    def set_vcp(self, cfg, code, value):
+        return set_vcp(cfg, code, value)
+
+    def switch(self, cfg, name):
+        return switch_input(cfg, name, origin="listener")
+
+
+class ListenerHandler(BaseHTTPRequestHandler):
+    server_version = "lg-monitor/" + VERSION
+    sys_version = ""
+    timeout = 10
+    backend = Backend()
+    config_loader = staticmethod(load_config)
+    token_loader = staticmethod(read_token)
+
+    ROUTES = {
+        ("GET", "/v1/ping"): "ping",
+        ("GET", "/v1/status"): "status",
+        ("POST", "/v1/brightness"): "brightness",
+        ("POST", "/v1/contrast"): "contrast",
+        ("POST", "/v1/switch"): "switch",
+    }
+
+    def log_message(self, fmt, *args):  # goes to the journal; never logs headers
+        sys.stderr.write("%s %s\n" % (self.client_address[0], fmt % args))
+
+    def _reply(self, code, payload):
+        data = (json.dumps(payload) + "\n").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle(self, method):
+        cfg = self.config_loader()
+        if not client_allowed(self.client_address[0], cfg.get("listener", "allow").strip().lower()):
+            return self._reply(403, {"ok": False, "error": "client address not allowed"})
+        action = self.ROUTES.get((method, self.path.split("?", 1)[0]))
+        if action is None:
+            return self._reply(404, {"ok": False, "error": "unknown endpoint"})
+        token = self.token_loader()
+        auth = self.headers.get("Authorization", "")
+        given = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if not token or not hmac.compare_digest(given.encode(), token.encode()):
+            time.sleep(0.5)  # slow down guessing
+            return self._reply(401, {"ok": False, "error": "missing or invalid token"})
+
+        body = {}
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._reply(400, {"ok": False, "error": "bad Content-Length"})
+            if length > MAX_BODY:
+                return self._reply(413, {"ok": False, "error": "body too large"})
+            raw = self.rfile.read(length) if length else b""
+            if raw.strip():
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    return self._reply(400, {"ok": False, "error": "body must be JSON"})
+                if not isinstance(body, dict):
+                    return self._reply(400, {"ok": False, "error": "body must be a JSON object"})
+        try:
+            if action == "ping":
+                return self._reply(200, {"ok": True, "version": VERSION})
+            if action == "status":
+                return self._reply(200, dict(ok=True, **self.backend.status(cfg)))
+            if action in ("brightness", "contrast"):
+                value = body.get("value")
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+                    return self._reply(400, {"ok": False, "error": "value must be an integer 0-100"})
+                code = 0x10 if action == "brightness" else 0x12
+                self.backend.set_vcp(cfg, code, value)
+                return self._reply(200, {"ok": True, action: value})
+            if action == "switch":
+                name = body.get("input", "home")
+                if not isinstance(name, str) or (name != "home" and
+                                                 INPUT_ALIASES.get(name.lower(), name.lower()) not in INPUTS):
+                    return self._reply(400, {"ok": False, "error": "input must be one of: home, %s" %
+                                             ", ".join(sorted(INPUTS))})
+                key = self.backend.switch(cfg, name)
+                return self._reply(200, {"ok": True, "input": key})
+        except LgError as exc:
+            return self._reply(500, {"ok": False, "error": str(exc)})
+        return self._reply(500, {"ok": False, "error": "unhandled"})
+
+    def do_GET(self):
+        self._handle("GET")
+
+    def do_POST(self):
+        self._handle("POST")
+
+
+class DualStackHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
+def make_server(bind, port, handler=ListenerHandler):
+    family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    DualStackHTTPServer.address_family = family
+    return DualStackHTTPServer((bind, port), handler)
+
+
+def cmd_serve(cfg, args):
+    if not read_token():
+        raise LgError("no token in %s - run 'lg-monitor token --regenerate' first" % TOKEN_FILE)
+    bind = args.bind or cfg.get("listener", "bind")
+    port = args.port or cfg.getint("listener", "port")
+    srv = make_server(bind, port)
+    sys.stderr.write("lg-monitor listener on %s:%d (allow=%s)\n" % (bind, port, cfg.get("listener", "allow")))
+    sys.stderr.flush()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Deskflow integration (read-only: we only READ Deskflow's config and log)
+# ---------------------------------------------------------------------------
+
+DESKFLOW_FLATPAK_ID = "org.deskflow.deskflow"
+DESKFLOW_CONF_CANDIDATES = [
+    os.path.join(HOME, ".var/app/org.deskflow.deskflow/config/Deskflow/Deskflow.conf"),
+    os.path.join(HOME, ".config/Deskflow/Deskflow.conf"),
+]
+SWITCH_LINE_RE = re.compile(r'\b(?:switch|jump) from "([^"]+)" to "([^"]+)"')
+
+
+def read_qt_ini(path):
+    """Very small reader for Qt's .conf/ini format. Returns {section: {key: value}}."""
+    data, section = {}, "General"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1]
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    data.setdefault(section, {})[k.strip()] = v.strip()
+    except OSError:
+        return None
+    return data
+
+
+def parse_server_conf_screens(path):
+    names = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return names
+    for m in re.finditer(r"section:\s*(screens|links)\s*\n(.*?)\nend", text, re.S):
+        for line in m.group(2).splitlines():
+            s = line.strip()
+            if s.endswith(":"):
+                names.append(s[:-1].strip())
+            elif "=" in s and m.group(1) == "links":
+                names.append(s.split("=", 1)[1].strip())
+    return names
+
+
+def deskflow_info():
+    """Detect Deskflow and gather (read-only) what we need from its settings."""
+    info = {"installed": False, "kind": None, "config": None, "log_to_file": False,
+            "log_file": None, "log_level": None, "screens": [], "local_screen": None}
+    flatpak_dirs = ["/var/lib/flatpak/app/" + DESKFLOW_FLATPAK_ID,
+                    os.path.join(HOME, ".local/share/flatpak/app", DESKFLOW_FLATPAK_ID)]
+    if any(os.path.isdir(d) for d in flatpak_dirs):
+        info.update(installed=True, kind="flatpak")
+    elif shutil.which("deskflow") or shutil.which("deskflow-core"):
+        info.update(installed=True, kind="native")
+    for conf in DESKFLOW_CONF_CANDIDATES:
+        data = read_qt_ini(conf)
+        if data is None:
+            continue
+        info["installed"] = True
+        info["kind"] = info["kind"] or ("flatpak" if "/.var/app/" in conf else "native")
+        info["config"] = conf
+        log = data.get("log", {})
+        info["log_to_file"] = log.get("toFile", "false").lower() == "true"
+        info["log_file"] = log.get("file") or None
+        info["log_level"] = log.get("level")
+        info["local_screen"] = data.get("core", {}).get("computerName")
+        screens = []
+        for sec, kv in data.items():
+            if sec.startswith("computer_") and kv.get("name"):
+                screens.append(kv["name"])
+        server_conf = data.get("server", {}).get("externalConfigFile") or os.path.join(
+            os.path.dirname(conf), "deskflow-server.conf")
+        screens += parse_server_conf_screens(server_conf)
+        if info["local_screen"]:
+            screens.insert(0, info["local_screen"])
+        seen = []
+        for s in screens:
+            if s and s not in seen:
+                seen.append(s)
+        info["screens"] = seen
+        break
+    return info
+
+
+FLATPAK_DATA_DIR = os.path.join(HOME, ".var/app", DESKFLOW_FLATPAK_ID)
+RECOMMENDED_FLATPAK_LOG = os.path.join(FLATPAK_DATA_DIR, "data", "deskflow.log")
+
+
+def tilde(path):
+    """Show paths under the home directory as ~/..."""
+    return "~" + path[len(HOME):] if path and path.startswith(HOME + os.sep) else path
+
+
+def deskflow_log_status(cfg, info=None):
+    """Return (path or None, human readable explanation)."""
+    path = cfg.get("deskflow", "log_file").strip()
+    if path and path != "auto":
+        path = os.path.expanduser(path)
+        return path, ("using %s (set in lg-monitor config)%s" %
+                      (tilde(path), "" if os.path.exists(path) else " - file does not exist yet"))
+    info = info or deskflow_info()
+    if info.get("log_to_file") and info.get("log_file"):
+        path = os.path.expanduser(info["log_file"])
+        if info.get("kind") == "flatpak" and not path.startswith(FLATPAK_DATA_DIR + os.sep):
+            return None, ("Deskflow (Flatpak) logs to %s, which is outside its sandbox, so the file "
+                          "is not visible here. Set Deskflow's log path to %s" % (tilde(path), RECOMMENDED_FLATPAK_LOG))
+        return path, "using Deskflow's log file %s%s" % (
+            tilde(path), "" if os.path.exists(path) else " (not created yet - restart the Deskflow server)")
+    for pattern in (os.path.join(FLATPAK_DATA_DIR, "**/*.log"),
+                    os.path.join(HOME, ".local/state/Deskflow/*.log"),
+                    os.path.join(HOME, ".local/share/Deskflow/*.log")):
+        hits = sorted(glob.glob(pattern, recursive=True), key=os.path.getmtime, reverse=True)
+        if hits:
+            return hits[0], "using the most recent Deskflow log file %s" % tilde(hits[0])
+    return None, ("Deskflow's 'Log to file' is off. In Deskflow open Settings, tick 'Log to file', set the "
+                  "path to %s and press OK/Apply." % (RECOMMENDED_FLATPAK_LOG if info.get("kind") == "flatpak"
+                                                      else "~/deskflow.log"))
+
+
+def deskflow_log_path(cfg, info=None):
+    return deskflow_log_status(cfg, info)[0]
+
+
+def screen_mapping(cfg):
+    mapping = {}
+    for screen, value in cfg.items("deskflow.screens"):
+        value = value.strip().lower()
+        if value in ("", "none", "off"):
+            continue
+        mapping[screen] = normalize_input(value)
+    return mapping
+
+
+class AutoSwitcher:
+    """Pure decision logic for the Deskflow auto-switch (no I/O, unit-tested).
+
+    Feed it log lines with on_line(); poll due() to find out whether a switch
+    should happen now. A pending switch is cancelled when the cursor comes
+    back before the delay expires.
+    """
+
+    def __init__(self, mapping, delay=5.0, cooldown=2.0, current=None):
+        self.mapping = dict(mapping)
+        self.delay = float(delay)
+        self.cooldown = float(cooldown)
+        self.current = current          # input we believe is displayed
+        self.pending = None             # (input, deadline)
+        self.last_switch = -1e9
+
+    def on_line(self, line, now):
+        m = SWITCH_LINE_RE.search(line)
+        if not m:
+            return None
+        dest = m.group(2)
+        target = self.mapping.get(dest)
+        if target is None or target == self.current:
+            self.pending = None
+            return ("cancel" if target else "ignore", dest)
+        self.pending = (target, now + self.delay)
+        return ("schedule", dest)
+
+    def due(self, now):
+        if not self.pending:
+            return None
+        target, deadline = self.pending
+        if now < deadline:
+            return None
+        if now - self.last_switch < self.cooldown:
+            self.pending = (target, self.last_switch + self.cooldown)
+            return None
+        return target
+
+    def mark_switched(self, target, now):
+        self.current = target
+        self.pending = None
+        self.last_switch = now
+
+    def sync_current(self, value):
+        if value and value != self.current:
+            self.current = value
+            if self.pending and self.pending[0] == value:
+                self.pending = None
+
+
+class FileFollower:
+    """`tail -F` for one file: survives rotation/truncation and late creation."""
+
+    def __init__(self, path):
+        self.path, self.fh, self.inode, self.buf = path, None, None, ""
+
+    def _open(self, at_end):
+        try:
+            fh = open(self.path, encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        st = os.fstat(fh.fileno())
+        if at_end:
+            fh.seek(0, os.SEEK_END)
+        self.fh, self.inode = fh, st.st_ino
+        return True
+
+    def close(self):
+        if self.fh is not None:
+            self.fh.close()
+            self.fh = None
+
+    def lines(self, first=False):
+        if self.fh is None and not self._open(at_end=first):
+            return []
+        try:
+            st = os.stat(self.path)
+            if st.st_ino != self.inode or st.st_size < self.fh.tell():
+                self.fh.close()
+                self.fh = None
+                if not self._open(at_end=False):
+                    return []
+        except OSError:
+            pass
+        chunk = self.fh.read()
+        if not chunk:
+            return []
+        self.buf += chunk
+        *complete, self.buf = self.buf.split("\n")
+        return complete
+
+
+def cmd_deskflow_watch(cfg, args):
+    log = lambda msg: (sys.stderr.write(time.strftime("%H:%M:%S ") + msg + "\n"), sys.stderr.flush())
+    cfg_mtime = None
+
+    def reload():
+        nonlocal cfg, cfg_mtime
+        try:
+            mtime = os.path.getmtime(CONFIG_FILE)
+        except OSError:
+            mtime = 0
+        if mtime != cfg_mtime:
+            cfg_mtime = mtime
+            cfg = load_config()
+            return True
+        return False
+
+    reload()
+    st = read_state()
+    sw = AutoSwitcher(screen_mapping(cfg), cfg.getfloat("deskflow", "delay"),
+                      cfg.getfloat("deskflow", "cooldown"),
+                      current=(st or {}).get("input") or normalize_input(cfg.get("monitor", "home_input")))
+    source = cfg.get("deskflow", "source").strip().lower()
+    path, why = deskflow_log_status(cfg)
+    log(why)
+    if source == "file" or (source == "auto" and path):
+        if not path:
+            raise LgError("no Deskflow log file found. In Deskflow open Settings, tick 'Log to file' "
+                          "and Apply, or set [deskflow] log_file in %s" % CONFIG_FILE)
+        log("watching Deskflow log file %s" % path)
+        follower = FileFollower(path)
+        follower.lines(first=True)
+        proc = None
+    else:
+        log("watching the user journal for Deskflow switch lines")
+        proc = subprocess.Popen(["journalctl", "--user", "-f", "-n0", "-o", "cat"],
+                                stdout=subprocess.PIPE, universal_newlines=True, bufsize=1)
+        follower = None
+    log("mapping: %s, delay %.1fs%s" % (sw.mapping or "(empty)", sw.delay, " [dry run]" if args.dry_run else ""))
+
+    try:
+        while True:
+            if reload():
+                sw.mapping = screen_mapping(cfg)
+                sw.delay = cfg.getfloat("deskflow", "delay")
+                sw.cooldown = cfg.getfloat("deskflow", "cooldown")
+                log("config reloaded: mapping %s, delay %.1fs" % (sw.mapping, sw.delay))
+            st = read_state()
+            if st and st.get("origin") != "deskflow":
+                sw.sync_current(st.get("input"))
+            if proc is not None:
+                ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+                lines = [proc.stdout.readline()] if ready else []
+                if proc.poll() is not None:
+                    raise LgError("journalctl exited")
+            else:
+                time.sleep(0.25)
+                lines = follower.lines()
+            now = time.monotonic()
+            for line in lines:
+                ev = sw.on_line(line, now)
+                if ev:
+                    log("cursor -> %s: %s" % (ev[1], ev[0]))
+            target = sw.due(time.monotonic())
+            if target:
+                log("switching monitor to %s" % target)
+                if not args.dry_run:
+                    try:
+                        switch_input(cfg, target, origin="deskflow")
+                    except LgError as exc:
+                        log("switch failed: %s" % exc)
+                sw.mark_switched(target, time.monotonic())
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if proc is not None:
+            proc.terminate()
+
+
+# ---------------------------------------------------------------------------
+# systemd --user helpers (used by the settings app)
+# ---------------------------------------------------------------------------
+
+def systemctl(*args):
+    res = subprocess.run(["systemctl", "--user"] + list(args), stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, universal_newlines=True)
+    return res.returncode, (res.stdout + res.stderr).strip()
+
+
+def unit_enabled(unit):
+    return systemctl("is-enabled", unit)[1].splitlines()[:1] == ["enabled"]
+
+
+def unit_active(unit):
+    return systemctl("is-active", unit)[1].splitlines()[:1] == ["active"]
+
+
+def _systemctl_ok(*args):
+    rc, out = systemctl(*args)
+    if rc != 0:
+        raise LgError(out or "systemctl %s failed" % " ".join(args))
+
+
+FEATURE_UNITS = {"listener": LISTENER_UNIT, "deskflow": DESKFLOW_UNIT}
+EXTENSION_UUID = "lg-monitor-switch@entangledquantum.github.io"
+
+
+def feature_enabled(cfg, feature):
+    return cfg.getboolean(feature, "enabled", fallback=False)
+
+
+def apply_services(cfg, only=None):
+    """Make systemd match the config: enabled features run now, and start at
+    login only while [general] autostart is on. Disabled features are stopped.
+    `only` limits the change to one feature."""
+    autostart = cfg.getboolean("general", "autostart", fallback=True)
+    _systemctl_ok("daemon-reload")
+    for feature, unit in FEATURE_UNITS.items():
+        if only and feature != only:
+            continue
+        if feature_enabled(cfg, feature):
+            if feature == "listener":
+                ensure_token()
+            _systemctl_ok("enable" if autostart else "disable", unit)
+            if not unit_active(unit):
+                systemctl("reset-failed", unit)
+                _systemctl_ok("start", unit)
+        else:
+            _systemctl_ok("disable", "--now", unit)
+
+
+def set_feature(cfg, feature, on):
+    cfg.set(feature, "enabled", "true" if on else "false")
+    save_config(cfg)
+    apply_services(cfg, only=feature)
+
+
+def set_autostart(cfg, on):
+    cfg.set("general", "autostart", "true" if on else "false")
+    save_config(cfg)
+    apply_services(cfg)
+
+
+def autostart_state(cfg):
+    """Real state: on if every enabled feature's unit is enabled in systemd.
+    With no feature enabled there is nothing to start, so use the config."""
+    enabled = [u for f, u in FEATURE_UNITS.items() if feature_enabled(cfg, f)]
+    if not enabled:
+        return cfg.getboolean("general", "autostart", fallback=True)
+    return all(unit_enabled(u) for u in enabled)
+
+
+def _enabled_extensions():
+    import ast
+    raw = subprocess.run(["gsettings", "get", "org.gnome.shell", "enabled-extensions"],
+                         stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+    if not raw or raw.startswith("@as"):
+        return []
+    try:
+        return list(ast.literal_eval(raw))
+    except (ValueError, SyntaxError):
+        return []
+
+
+def extension_enabled():
+    return EXTENSION_UUID in _enabled_extensions()
+
+
+def set_extension(on):
+    """Show/hide the top bar menu. gnome-extensions only knows extensions the
+    running shell has loaded, so fall back to editing the gsettings list."""
+    rc = subprocess.run(["gnome-extensions", "enable" if on else "disable", EXTENSION_UUID],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    cur = _enabled_extensions()
+    if rc != 0 or (EXTENSION_UUID in cur) != on:
+        cur = [u for u in cur if u != EXTENSION_UUID] + ([EXTENSION_UUID] if on else [])
+        subprocess.run(["gsettings", "set", "org.gnome.shell", "enabled-extensions", str(cur)], check=False)
+
+
+def services_status(cfg):
+    out = {"autostart": autostart_state(cfg), "top_bar_extension": extension_enabled()}
+    for feature, unit in FEATURE_UNITS.items():
+        out[feature] = {"enabled": feature_enabled(cfg, feature), "unit": unit,
+                        "starts_at_login": unit_enabled(unit), "running": unit_active(unit)}
+    return out
+
+
+def lan_addresses():
+    addrs = []
+    try:
+        out = subprocess.run(["hostname", "-I"], stdout=subprocess.PIPE, universal_newlines=True).stdout
+        for a in out.split():
+            try:
+                ip = ipaddress.ip_address(a)
+            except ValueError:
+                continue
+            if ip.version == 4 and ip.is_private and not a.startswith("172.17."):
+                addrs.append(a)
+    except OSError:
+        pass
+    return addrs
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def cmd_get(cfg, args):
+    info = {"switch_target": cfg.get("monitor", "switch_target"),
+            "switch_label": cfg.get("monitor", "switch_target_name")}
+    try:
+        info.update(get_levels(cfg))
+    except LgError as exc:
+        if args.json:
+            info["error"] = str(exc)
+            print(json.dumps(info))
+            return 1
+        raise
+    if args.json:
+        print(json.dumps(info))
+    else:
+        print("brightness %d\ncontrast %d" % (info["brightness"], info["contrast"]))
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="lg-monitor", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version="lg-monitor " + VERSION)
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    g = sub.add_parser("get", help="print brightness and contrast")
+    g.add_argument("--json", action="store_true")
+    sub.add_parser("set-brightness", help="set brightness 0-100").add_argument("value")
+    sub.add_parser("set-contrast", help="set contrast 0-100").add_argument("value")
+    s = sub.add_parser("switch", help="switch input (default: configured switch_target)")
+    s.add_argument("input", nargs="?", help="dp|dp1|dp2|hdmi1|hdmi2|home")
+    sub.add_parser("detect", help="detect and print the monitor's I2C bus")
+    sub.add_parser("packet", help="print the raw switch packets (no I/O)")
+    t = sub.add_parser("token", help="print (or create) the LAN listener token")
+    t.add_argument("--regenerate", action="store_true")
+    sv = sub.add_parser("serve", help="run the LAN listener")
+    sv.add_argument("--bind")
+    sv.add_argument("--port", type=int)
+    dw = sub.add_parser("deskflow-watch", help="auto-switch input when Deskflow moves the cursor")
+    dw.add_argument("--dry-run", action="store_true", help="log decisions, never switch")
+    sub.add_parser("deskflow-info", help="show what was detected about Deskflow (read-only)")
+    svc = sub.add_parser("service", help="turn the LAN listener or Deskflow auto-switch on/off")
+    svc.add_argument("feature", choices=sorted(FEATURE_UNITS))
+    svc.add_argument("state", choices=["on", "off"])
+    au = sub.add_parser("autostart", help="start enabled services at login (on/off) or show status")
+    au.add_argument("state", choices=["on", "off", "status", "apply"], nargs="?", default="status",
+                    help="apply = make systemd match the config file")
+    tb = sub.add_parser("top-bar", help="show/hide the GNOME top bar menu (on/off) or show status")
+    tb.add_argument("state", choices=["on", "off", "status"], nargs="?", default="status")
+    args = p.parse_args(argv)
+    if not args.cmd:
+        p.print_help()
+        return 2
+    try:
+        cfg = load_config()
+        if args.cmd == "get":
+            return cmd_get(cfg, args)
+        if args.cmd == "set-brightness":
+            print(set_vcp(cfg, 0x10, args.value))
+        elif args.cmd == "set-contrast":
+            print(set_vcp(cfg, 0x12, args.value))
+        elif args.cmd == "switch":
+            print("switched to %s" % INPUT_LABELS[switch_input(cfg, args.input)])
+        elif args.cmd == "detect":
+            forget_bus_cache()
+            print("/dev/i2c-%d" % detect_bus(cfg, use_cache=False))
+        elif args.cmd == "packet":
+            for key, val in sorted(INPUTS.items()):
+                print("%-6s %s" % (key, " ".join("0x%02x" % b for b in lg_input_packet(val))))
+        elif args.cmd == "token":
+            print(ensure_token(regenerate=args.regenerate))
+        elif args.cmd == "serve":
+            return cmd_serve(cfg, args)
+        elif args.cmd == "deskflow-watch":
+            return cmd_deskflow_watch(cfg, args)
+        elif args.cmd == "deskflow-info":
+            info = deskflow_info()
+            info["resolved_log_file"], info["log_status"] = deskflow_log_status(cfg, info)
+            print(json.dumps(info, indent=2))
+        elif args.cmd == "service":
+            set_feature(cfg, args.feature, args.state == "on")
+            print(json.dumps(services_status(cfg)[args.feature]))
+        elif args.cmd == "autostart":
+            if args.state == "apply":
+                apply_services(cfg)
+            elif args.state != "status":
+                set_autostart(cfg, args.state == "on")
+            print(json.dumps(services_status(cfg), indent=2))
+        elif args.cmd == "top-bar":
+            if args.state != "status":
+                set_extension(args.state == "on")
+            print("top bar menu: %s" % ("on" if extension_enabled() else "off"))
+        return 0
+    except LgError as exc:
+        sys.stderr.write("lg-monitor: %s\n" % exc)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,6 @@
+{
+  "uuid": "lgm-test-harness@local",
+  "name": "LG Monitor Switch test harness",
+  "description": "Test-only: opens the LG Monitor Switch menu and takes screenshots inside a throwaway headless GNOME Shell.",
+  "shell-version": ["46", "47", "48"]
+}

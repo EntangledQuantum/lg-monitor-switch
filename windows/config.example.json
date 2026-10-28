@@ -1,0 +1,10 @@
+{
+  "linux_host": "192.168.1.20",
+  "linux_port": 47320,
+  "token": "paste the output of `lg-monitor token` (run on Linux) here",
+  "monitor_index": -1,
+  "monitor_match": "GSM",
+  "brightness_via": "local",
+  "switch_method": "linux",
+  "ddc60_value": 15
+}

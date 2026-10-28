@@ -1,0 +1,20 @@
+# Secrets / per-user config - never commit
+token
+*.token
+config.ini
+config.json
+!windows/config.example.json
+.env
+
+# Python / editors / OS
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# test output
+harness-out/
+dist/

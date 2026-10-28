@@ -1,0 +1,14 @@
+[Unit]
+Description=LG Monitor Switch - follow Deskflow screen changes and switch the monitor input
+Documentation=https://github.com/EntangledQuantum/lg-monitor-switch
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lg-monitor deskflow-watch
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LG Monitor Switch
+GenericName=Monitor Settings
+Comment=Brightness, contrast and input switching for a shared LG UltraGear monitor
+Exec=lg-monitor-settings
+Icon=io.github.entangledquantum.LgMonitorSwitch
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=monitor;display;brightness;contrast;input;ddc;kvm;deskflow;
+StartupNotify=true

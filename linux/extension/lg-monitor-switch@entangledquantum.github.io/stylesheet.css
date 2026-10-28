@@ -1,0 +1,15 @@
+.lg-monitor-menu {
+  min-width: 20em;
+}
+.lg-monitor-row {
+  spacing: 12px;
+}
+.lg-monitor-value {
+  min-width: 3.2em;
+  text-align: right;
+  font-feature-settings: "tnum";
+}
+.lg-monitor-status {
+  font-size: 0.85em;
+  color: #a0a0a0;
+}

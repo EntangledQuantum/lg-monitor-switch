@@ -1,0 +1,15 @@
+[Unit]
+Description=LG Monitor Switch - LAN listener (lets the other computer switch the monitor back)
+Documentation=https://github.com/EntangledQuantum/lg-monitor-switch
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lg-monitor serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

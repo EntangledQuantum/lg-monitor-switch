@@ -1,0 +1,483 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""LG Monitor Switch - settings window (GTK 4 + libadwaita).
+
+Must run with the system Python (/usr/bin/python3) which has PyGObject.
+All monitor logic lives in the `lg-monitor` script next to this file.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+
+def load_backend():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(here, "lg-monitor"), os.path.expanduser("~/.local/bin/lg-monitor")):
+        if os.path.exists(path):
+            loader = importlib.machinery.SourceFileLoader("lg_monitor", path)
+            spec = importlib.util.spec_from_loader("lg_monitor", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise SystemExit("lg-monitor backend not found next to %s or in ~/.local/bin" % __file__)
+
+
+lg = load_backend()
+
+INPUT_KEYS = ["dp1", "dp2", "hdmi1", "hdmi2"]
+INPUT_NAMES = [lg.INPUT_LABELS[k] for k in INPUT_KEYS]
+MAP_KEYS = ["none"] + INPUT_KEYS
+MAP_NAMES = ["Do nothing"] + INPUT_NAMES
+
+
+def run_bg(fn, done):
+    """Run fn() in a thread, then done(result, error) in the main loop."""
+    def worker():
+        try:
+            res, err = fn(), None
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            res, err = None, exc
+        GLib.idle_add(lambda: (done(res, err), False)[1])
+    threading.Thread(target=worker, daemon=True).start()
+
+
+class SettingsWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="LG Monitor Switch")
+        self.set_default_size(620, 820)
+        self.cfg = lg.load_config()
+        self.deskflow = lg.deskflow_info()
+        self._loading = True
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        view.add_top_bar(header)
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        page.add(self._startup_group())
+        page.add(self._monitor_group())
+        page.add(self._switch_group())
+        page.add(self._listener_group())
+        page.add(self._deskflow_group())
+        self._loading = False
+        self._detect()
+
+    # ---------------------------------------------------------------- helpers
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=3))
+
+    def save(self, message="Saved"):
+        if self._loading:
+            return
+        try:
+            lg.save_config(self.cfg)
+            self.toast(message)
+        except OSError as exc:
+            self.toast("Could not save: %s" % exc)
+
+    def combo(self, title, names, selected, on_change, subtitle=None):
+        row = Adw.ComboRow(title=title, model=Gtk.StringList.new(names), use_markup=False)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.set_selected(selected)
+        row.connect("notify::selected", lambda r, _p: on_change(r.get_selected()))
+        return row
+
+    def input_index(self, value):
+        try:
+            return INPUT_KEYS.index(lg.normalize_input(value))
+        except lg.LgError:
+            return 0
+
+    # ---------------------------------------------------------------- startup
+    def unit_state(self, unit):
+        running = lg.unit_active(unit)
+        at_login = lg.unit_enabled(unit)
+        if running:
+            return "running" + (", starts at login" if at_login else " (this session only)")
+        return "not running" + (" (starts at login)" if at_login else "")
+
+    def _startup_group(self):
+        g = Adw.PreferencesGroup(title="Startup")
+        self.autostart_row = Adw.SwitchRow(
+            title="Start automatically at login",
+            subtitle="Starts the background services you enable below (LAN listener, Deskflow auto-switch)")
+        self.autostart_row.set_active(lg.autostart_state(self.cfg))
+        self.autostart_row.connect("notify::active", self._on_autostart_toggled)
+        g.add(self.autostart_row)
+        self.topbar_row = Adw.SwitchRow(title="Show in the top bar",
+                                        subtitle="Brightness, contrast and Switch menu (GNOME Shell extension)")
+        self.topbar_row.set_active(lg.extension_enabled())
+        self.topbar_row.connect("notify::active", self._on_topbar_toggled)
+        g.add(self.topbar_row)
+        self.services_row = Adw.ActionRow(title="Background services", use_markup=False)
+        self.services_row.add_css_class("property")
+        g.add(self.services_row)
+        self._update_startup_rows()
+        return g
+
+    def _update_startup_rows(self):
+        parts = []
+        for feature, label in (("listener", "LAN listener"), ("deskflow", "Deskflow auto-switch")):
+            if lg.feature_enabled(self.cfg, feature):
+                parts.append("%s: %s" % (label, self.unit_state(lg.FEATURE_UNITS[feature])))
+            else:
+                parts.append("%s: off" % label)
+        self.services_row.set_subtitle("\n".join(parts))
+
+    def _on_autostart_toggled(self, row, _p):
+        if self._loading:
+            return
+        try:
+            lg.set_autostart(self.cfg, row.get_active())
+            self.toast("Autostart %s" % ("on" if row.get_active() else "off"))
+        except lg.LgError as exc:
+            self.toast("systemctl failed: %s" % exc)
+        self._update_startup_rows()
+
+    def _on_topbar_toggled(self, row, _p):
+        if self._loading:
+            return
+        lg.set_extension(row.get_active())
+        self.toast("Top bar menu %s" % ("enabled" if row.get_active() else "disabled"))
+
+    # ---------------------------------------------------------------- monitor
+    def _monitor_group(self):
+        g = Adw.PreferencesGroup(title="Monitor",
+                                 description="Brightness, contrast and input are changed over DDC/CI. "
+                                             "Make sure DDC/CI is ON and Auto Input Switch is OFF in the monitor menu.")
+        self.detect_row = Adw.ActionRow(title="Detected monitor", subtitle="Detecting…", use_markup=False)
+        self.detect_row.add_prefix(Gtk.Image.new_from_icon_name("video-display-symbolic"))
+        btn = Gtk.Button(label="Detect", valign=Gtk.Align.CENTER)
+        btn.connect("clicked", lambda _b: self._detect(force=True))
+        self.detect_row.add_suffix(btn)
+        g.add(self.detect_row)
+
+        bus = self.cfg.get("monitor", "bus").strip().lower()
+        self.auto_bus = Adw.SwitchRow(title="Find the I²C bus automatically",
+                                      subtitle="Turn off to force a specific /dev/i2c-N bus")
+        self.auto_bus.set_active(bus in ("", "auto"))
+        self.bus_row = Adw.SpinRow.new_with_range(0, 255, 1)
+        self.bus_row.set_title("I²C bus number")
+        self.bus_row.set_value(int(bus) if bus.isdigit() else 0)
+        self.bus_row.set_sensitive(not self.auto_bus.get_active())
+        self.auto_bus.connect("notify::active", self._on_bus_changed)
+        self.bus_row.connect("notify::value", self._on_bus_changed)
+        g.add(self.auto_bus)
+        g.add(self.bus_row)
+
+        g.add(self.combo("This computer is connected to", INPUT_NAMES,
+                         self.input_index(self.cfg.get("monitor", "home_input")),
+                         lambda i: self._set("monitor", "home_input", INPUT_KEYS[i]),
+                         subtitle="Used when the other computer asks to switch back"))
+        return g
+
+    def _on_bus_changed(self, *_a):
+        auto = self.auto_bus.get_active()
+        self.bus_row.set_sensitive(not auto)
+        self.cfg.set("monitor", "bus", "auto" if auto else str(int(self.bus_row.get_value())))
+        lg.forget_bus_cache()
+        self.save()
+
+    def _detect(self, force=False):
+        self.detect_row.set_subtitle("Detecting…")
+        if force:
+            lg.forget_bus_cache()
+
+        def work():
+            bus = lg.detect_bus(self.cfg, use_cache=not force)
+            return bus, lg.get_levels(self.cfg)
+
+        def done(res, err):
+            if err:
+                self.detect_row.set_subtitle("Not found: %s" % err)
+            else:
+                bus, levels = res
+                self.detect_row.set_subtitle("%s on /dev/i2c-%d — brightness %d, contrast %d" % (
+                    self.cfg.get("monitor", "model"), bus, levels["brightness"], levels["contrast"]))
+        run_bg(work, done)
+
+    def _set(self, section, key, value):
+        self.cfg.set(section, key, value)
+        self.save()
+
+    # ----------------------------------------------------------------- switch
+    def _switch_group(self):
+        g = Adw.PreferencesGroup(title="Switch button",
+                                 description="What the “Switch” entry in the top bar menu does.")
+        g.add(self.combo("Switch the monitor to", INPUT_NAMES,
+                         self.input_index(self.cfg.get("monitor", "switch_target")),
+                         lambda i: self._set("monitor", "switch_target", INPUT_KEYS[i])))
+        name = Adw.EntryRow(title="Name of the other computer (button label)")
+        name.set_text(self.cfg.get("monitor", "switch_target_name"))
+        name.set_show_apply_button(True)
+        name.connect("apply", lambda r: self._set("monitor", "switch_target_name",
+                                                  r.get_text().strip() or "Windows"))
+        g.add(name)
+        return g
+
+    # --------------------------------------------------------------- listener
+    def _listener_group(self):
+        g = Adw.PreferencesGroup(
+            title="LAN listener",
+            description="Lets the Windows app switch the monitor back to this computer and change "
+                        "brightness/contrast through it. Requests need the token below.")
+        self.listener_switch = Adw.SwitchRow(title="Enable LAN listener")
+        self.listener_switch.set_active(lg.feature_enabled(self.cfg, "listener"))
+        self.listener_switch.connect("notify::active", self._on_listener_toggled)
+        g.add(self.listener_switch)
+
+        self.port_row = Adw.SpinRow.new_with_range(1024, 65535, 1)
+        self.port_row.set_title("TCP port")
+        self.port_row.set_value(self.cfg.getint("listener", "port"))
+        self.port_row.connect("notify::value", self._on_port_changed)
+        g.add(self.port_row)
+
+        self.token_row = Adw.ActionRow(title="Token", use_markup=False)
+        self.token_row.add_css_class("property")
+        self._token_visible = False
+        self.show_btn = Gtk.Button(icon_name="view-reveal-symbolic", valign=Gtk.Align.CENTER,
+                                   tooltip_text="Show / hide")
+        self.show_btn.add_css_class("flat")
+        self.show_btn.connect("clicked", self._toggle_token)
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Copy")
+        copy_btn.add_css_class("flat")
+        copy_btn.connect("clicked", self._copy_token)
+        regen_btn = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER,
+                               tooltip_text="Generate a new token")
+        regen_btn.add_css_class("flat")
+        regen_btn.connect("clicked", self._regenerate_token)
+        for b in (self.show_btn, copy_btn, regen_btn):
+            self.token_row.add_suffix(b)
+        g.add(self.token_row)
+
+        self.addr_row = Adw.ActionRow(title="Windows app settings", use_markup=False)
+        self.addr_row.add_css_class("property")
+        self.addr_row.set_subtitle_selectable(True)
+        g.add(self.addr_row)
+        fw = Adw.ActionRow(title="Firewall", use_markup=False,
+                           subtitle="If ufw is active run: sudo ufw allow from 192.168.0.0/16 to any "
+                                    "port %d proto tcp" % self.cfg.getint("listener", "port"))
+        fw.set_subtitle_selectable(True)
+        self.fw_row = fw
+        g.add(fw)
+        self._update_listener_rows()
+        return g
+
+    def _update_listener_rows(self):
+        tok = lg.read_token()
+        if not tok:
+            self.token_row.set_subtitle("(none yet — created when the listener is enabled)")
+        else:
+            self.token_row.set_subtitle(tok if self._token_visible else "•" * 16)
+        port = int(self.port_row.get_value())
+        addrs = lg.lan_addresses() or ["<this computer's IP>"]
+        state = self.unit_state(lg.LISTENER_UNIT)
+        self.addr_row.set_subtitle("Listener %s. Linux host: %s   Port: %d" % (state, " or ".join(addrs), port))
+        self.fw_row.set_subtitle("If ufw is active run:  sudo ufw allow from 192.168.0.0/16 to any port "
+                                 "%d proto tcp" % port)
+
+    def _on_listener_toggled(self, row, _p):
+        if self._loading:
+            return
+        on = row.get_active()
+        try:
+            lg.set_feature(self.cfg, "listener", on)
+            self.toast("Listener %s" % ("enabled" if on else "disabled"))
+        except lg.LgError as exc:
+            self.toast("systemctl failed: %s" % exc)
+        GLib.timeout_add(600, lambda: (self._update_listener_rows(), self._update_startup_rows(), False)[2])
+
+    def _on_port_changed(self, row, _p):
+        self.cfg.set("listener", "port", str(int(row.get_value())))
+        self.save()
+        if lg.unit_active(lg.LISTENER_UNIT):
+            lg.systemctl("restart", lg.LISTENER_UNIT)
+        self._update_listener_rows()
+
+    def _toggle_token(self, _b):
+        self._token_visible = not self._token_visible
+        self.show_btn.set_icon_name("view-conceal-symbolic" if self._token_visible else "view-reveal-symbolic")
+        self._update_listener_rows()
+
+    def _copy_token(self, _b):
+        tok = lg.read_token()
+        if tok:
+            Gdk.Display.get_default().get_clipboard().set(tok)
+            self.toast("Token copied")
+
+    def _regenerate_token(self, _b):
+        def respond(response):
+            if response == "regen":
+                lg.ensure_token(regenerate=True)
+                self._update_listener_rows()
+                self.toast("New token created — update it in the Windows app")
+        self.ask("Generate a new token?",
+                 "The Windows app will stop working until you paste the new token into its settings.",
+                 [("cancel", "Cancel", None), ("regen", "Generate", Adw.ResponseAppearance.DESTRUCTIVE)],
+                 respond)
+
+    # --------------------------------------------------------------- deskflow
+    def _deskflow_group(self):
+        g = Adw.PreferencesGroup(
+            title="Deskflow auto-switch",
+            description="Switch the monitor input automatically when the Deskflow cursor moves to the other "
+                        "computer. Off by default. lg-monitor never changes Deskflow's settings — it only reads "
+                        "Deskflow's log.")
+        info = self.deskflow
+        if not info["installed"]:
+            row = Adw.ActionRow(title="Deskflow is not installed", use_markup=False,
+                                subtitle="Install Deskflow (deskflow.org) to use this feature.")
+            row.add_prefix(Gtk.Image.new_from_icon_name("dialog-information-symbolic"))
+            g.add(row)
+            return g
+
+        warn = Adw.ActionRow(
+            use_markup=False,
+            title="Use only one automatic switcher",
+            subtitle="While this is on, do not also use the Windows app's “Switch to Linux” button or any "
+                     "Windows-side automatic switching — both sides could fight over the input.")
+        warn.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
+        g.add(warn)
+
+        self.df_switch = Adw.SwitchRow(title="Switch input when the cursor changes computer",
+                                       subtitle="Deskflow found (%s)" % info["kind"])
+        self.df_switch.set_active(lg.feature_enabled(self.cfg, "deskflow"))
+        self.df_switch.connect("notify::active", self._on_deskflow_toggled)
+        g.add(self.df_switch)
+
+        delay = Adw.SpinRow.new_with_range(0, 60, 0.5)
+        delay.set_digits(1)
+        delay.set_title("Delay before switching (seconds)")
+        delay.set_subtitle("A pending switch is cancelled if the cursor comes back in time")
+        delay.set_value(self.cfg.getfloat("deskflow", "delay"))
+        delay.connect("notify::value", lambda r, _p: self._set("deskflow", "delay", "%g" % r.get_value()))
+        g.add(delay)
+
+        path, why = lg.deskflow_log_status(self.cfg, info)
+        self.log_row = Adw.ExpanderRow(title="Deskflow log file", subtitle=why, use_markup=False)
+        self.log_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "emblem-ok-symbolic" if path and os.path.exists(path) else "dialog-warning-symbolic"))
+        steps = Gtk.Label(wrap=True, xalign=0, selectable=True, margin_top=8, margin_bottom=8,
+                          margin_start=12, margin_end=12)
+        steps.set_text(
+            "Deskflow only reports screen changes in its log, so its “Log to file” option must be on. "
+            "lg-monitor will not change this for you:\n\n"
+            "1. Open Deskflow → Settings (File → Settings, or the gear menu).\n"
+            "2. In the Log section tick “Log to file” and keep the log level at Info (or higher).\n"
+            "3. Set the log path to:\n    %s\n"
+            "   (the Flatpak version can only write inside its own ~/.var/app folder).\n"
+            "4. Press OK, then stop and start the Deskflow server once.\n\n"
+            "Or type the log file path below." % (lg.RECOMMENDED_FLATPAK_LOG if info["kind"] == "flatpak"
+                                                  else "~/deskflow.log"))
+        self.log_row.add_row(steps)
+        entry = Adw.EntryRow(title="Log file path (empty = automatic)")
+        val = self.cfg.get("deskflow", "log_file")
+        entry.set_text("" if val == "auto" else val)
+        entry.set_show_apply_button(True)
+        entry.connect("apply", lambda r: self._set("deskflow", "log_file", r.get_text().strip() or "auto"))
+        self.log_row.add_row(entry)
+        g.add(self.log_row)
+
+        mapping = dict(self.cfg.items("deskflow.screens"))
+        screens = list(info["screens"])
+        for s in mapping:
+            if s not in screens:
+                screens.append(s)
+        if not screens:
+            g.add(Adw.ActionRow(title="No Deskflow screens found",
+                                subtitle="Add screens under [deskflow.screens] in ~/.config/lg-monitor/config.ini"))
+        for screen in screens:
+            if screen in mapping:
+                current = mapping[screen].strip().lower() or "none"
+            elif screen == info["local_screen"]:
+                current = self.cfg.get("monitor", "home_input")
+            else:
+                current = self.cfg.get("monitor", "switch_target")
+            try:
+                idx = MAP_KEYS.index(current if current == "none" else lg.normalize_input(current))
+            except (ValueError, lg.LgError):
+                idx = 0
+            if screen not in mapping:
+                self.cfg.set("deskflow.screens", screen, MAP_KEYS[idx])
+            label = "Cursor on “%s”%s" % (screen, " (this computer)" if screen == info["local_screen"] else "")
+            g.add(self.combo(label, MAP_NAMES, idx,
+                             lambda i, s=screen: self._set("deskflow.screens", s, MAP_KEYS[i]),
+                             subtitle="switch the monitor to"))
+        return g
+
+    def _on_deskflow_toggled(self, row, _p):
+        if self._loading:
+            return
+        if not row.get_active():
+            try:
+                lg.set_feature(self.cfg, "deskflow", False)
+                self.toast("Deskflow auto-switch disabled")
+            except lg.LgError as exc:
+                self.toast(str(exc))
+            self._update_startup_rows()
+            return
+
+        def respond(response):
+            if response != "enable":
+                self._loading = True
+                row.set_active(False)
+                self._loading = False
+                return
+            try:
+                lg.set_feature(self.cfg, "deskflow", True)
+                self.toast("Deskflow auto-switch enabled")
+            except lg.LgError as exc:
+                self.toast(str(exc))
+            self._update_startup_rows()
+        self.ask("Enable Deskflow auto-switch?",
+                 "The monitor input will change automatically %g s after the cursor moves to another computer.\n\n"
+                 "Do not also use the Windows app's “Switch to Linux” button or any Windows-side automatic "
+                 "switching while this is on — both sides could fight over the input."
+                 % self.cfg.getfloat("deskflow", "delay"),
+                 [("cancel", "Cancel", None), ("enable", "Enable", Adw.ResponseAppearance.SUGGESTED)],
+                 respond)
+
+    # ----------------------------------------------------------------- dialog
+    def ask(self, heading, body, responses, callback):
+        if hasattr(Adw, "AlertDialog"):
+            dlg = Adw.AlertDialog(heading=heading, body=body)
+        else:
+            dlg = Adw.MessageDialog(transient_for=self, heading=heading, body=body)
+        for rid, label, appearance in responses:
+            dlg.add_response(rid, label)
+            if appearance is not None:
+                dlg.set_response_appearance(rid, appearance)
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: callback(r))
+        if hasattr(Adw, "AlertDialog"):
+            dlg.present(self)
+        else:
+            dlg.present()
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=lg.APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or SettingsWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    GLib.set_application_name("LG Monitor Switch")
+    sys.exit(App().run(sys.argv))
